@@ -30,6 +30,7 @@
 #include <list>
 #include <vector>
 #include <deque>
+#include <cstdint>
 #include <boost/mpl/vector.hpp>
 #include <boost/mpl/contains_fwd.hpp>
 

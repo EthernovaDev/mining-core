@@ -1,9 +1,13 @@
 using Autofac;
 using Microsoft.AspNetCore.Mvc;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
+using Microsoft.Extensions.Caching.Memory;
+using Miningcore.Api.Enrichment;
 using Miningcore.Api.Extensions;
 using Miningcore.Api.Responses;
 using Miningcore.Blockchain;
+using Miningcore.Blockchain.Ethereum;
+using Miningcore.Blockchain.Ethereum.Configuration;
 using Miningcore.Configuration;
 using Miningcore.Extensions;
 using Miningcore.Mining;
@@ -34,6 +38,7 @@ public class PoolApiController : ApiControllerBase
         clock = ctx.Resolve<IMasterClock>();
         pools = ctx.Resolve<ConcurrentDictionary<string, IMiningPool>>();
         adcp = _adcp;
+        ethBlockEnricher = new EthereumBlockEnricher(ctx.Resolve<IHttpClientFactory>(), ctx.Resolve<IMemoryCache>());
     }
 
     private readonly IStatsRepository statsRepo;
@@ -44,6 +49,7 @@ public class PoolApiController : ApiControllerBase
     private readonly IMasterClock clock;
     private readonly IActionDescriptorCollectionProvider adcp;
     private readonly ConcurrentDictionary<string, IMiningPool> pools;
+    private readonly EthereumBlockEnricher ethBlockEnricher;
 
     private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
 
@@ -56,35 +62,69 @@ public class PoolApiController : ApiControllerBase
         {
             Pools = await Task.WhenAll(clusterConfig.Pools.Where(x => x.Enabled).Select(async config =>
             {
-                // load stats
-                var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, config.Id, ct));
-
-                // get pool
-                pools.TryGetValue(config.Id, out var pool);
-
-                // map
-                var result = config.ToPoolInfo(mapper, stats, pool);
-
-                // enrich
-                result.TotalPaid = await cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, config.Id, ct));
-                result.TotalBlocks = await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, config.Id, ct));
-                var lastBlockTime = await cf.Run(con => blocksRepo.GetLastPoolBlockTimeAsync(con, config.Id));
-                result.LastPoolBlockTime = lastBlockTime;
-
-                if(lastBlockTime.HasValue)
+                try
                 {
-                    DateTime startTime = lastBlockTime.Value;
-                    var poolEffort = await cf.Run(con => shareRepo.GetEffortBetweenCreatedAsync(con, config.Id, pool.ShareMultiplier, startTime, clock.Now));
-                    result.PoolEffort = poolEffort.Value;
+                    // load stats (may be null on fresh setups)
+                    var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, config.Id, ct)) ??
+                        new Persistence.Model.PoolStats { PoolId = config.Id, Created = clock.Now };
+
+                    // get pool (may be null during startup)
+                    pools.TryGetValue(config.Id, out var pool);
+
+                    // map
+                    var result = config.ToPoolInfo(mapper, stats, pool);
+
+                    // enrich
+                    result.TotalPaid = await cf.Run(con => statsRepo.GetTotalPoolPaymentsAsync(con, config.Id, ct));
+                    result.TotalBlocks = await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, config.Id, ct));
+                    var lastBlockTime = await cf.Run(con => blocksRepo.GetLastPoolBlockTimeAsync(con, config.Id));
+                    result.LastPoolBlockTime = lastBlockTime;
+
+                    if(lastBlockTime.HasValue)
+                    {
+                        var startTime = lastBlockTime.Value;
+                        var shareMultiplier = pool?.ShareMultiplier ?? 1;
+
+                        try
+                        {
+                            var poolEffort = await cf.Run(con => shareRepo.GetEffortBetweenCreatedAsync(con, config.Id, shareMultiplier, startTime, clock.Now));
+                            result.PoolEffort = poolEffort.GetValueOrDefault();
+                        }
+
+                        catch(Exception ex)
+                        {
+                            logger.Warn(ex, () => $"Error computing poolEffort for pool {config.Id}");
+                            result.PoolEffort = 0;
+                        }
+                    }
+
+                    else
+                    {
+                        result.PoolEffort = 0;
+                    }
+
+                    var from = clock.Now.AddHours(-topMinersRange);
+                    var minersByHashrate = await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, config.Id, from, 0, 15, ct));
+                    result.TopMiners = minersByHashrate?.Select(mapper.Map<MinerPerformanceStats>).ToArray() ?? Array.Empty<MinerPerformanceStats>();
+
+                    return result;
                 }
 
-                var from = clock.Now.AddHours(-topMinersRange);
+                catch(Exception ex)
+                {
+                    logger.Error(ex, () => $"Error building /api/pools response for pool {config.Id}");
 
-                var minersByHashrate = await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, config.Id, from, 0, 15, ct));
+                    pools.TryGetValue(config.Id, out var pool);
+                    var safeStats = new Persistence.Model.PoolStats { PoolId = config.Id, Created = clock.Now };
+                    var result = config.ToPoolInfo(mapper, safeStats, pool);
 
-                result.TopMiners = minersByHashrate.Select(mapper.Map<MinerPerformanceStats>).ToArray();
+                    result.TopMiners = Array.Empty<MinerPerformanceStats>();
+                    result.TotalPaid = 0;
+                    result.TotalBlocks = 0;
+                    result.PoolEffort = 0;
 
-                return result;
+                    return result;
+                }
             }).ToArray())
         };
 
@@ -123,7 +163,8 @@ public class PoolApiController : ApiControllerBase
         var pool = GetPool(poolId);
 
         // load stats
-        var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, pool.Id, ct));
+        var stats = await cf.Run(con => statsRepo.GetLastPoolStatsAsync(con, pool.Id, ct)) ??
+            new Persistence.Model.PoolStats { PoolId = pool.Id, Created = clock.Now };
 
         // get pool
         pools.TryGetValue(pool.Id, out var poolInstance);
@@ -142,15 +183,25 @@ public class PoolApiController : ApiControllerBase
         if(lastBlockTime.HasValue)
         {
             DateTime startTime = lastBlockTime.Value;
-            var poolEffort = await cf.Run(con => shareRepo.GetEffortBetweenCreatedAsync(con, pool.Id, poolInstance.ShareMultiplier, startTime, clock.Now));
-            response.Pool.PoolEffort = poolEffort.Value;
+
+            try
+            {
+                var shareMultiplier = poolInstance?.ShareMultiplier ?? 1;
+                var poolEffort = await cf.Run(con => shareRepo.GetEffortBetweenCreatedAsync(con, pool.Id, shareMultiplier, startTime, clock.Now));
+                response.Pool.PoolEffort = poolEffort.GetValueOrDefault();
+            }
+
+            catch(Exception ex)
+            {
+                logger.Warn(ex, () => $"Error computing poolEffort for pool {pool.Id}");
+                response.Pool.PoolEffort = 0;
+            }
         }
 
         var from = clock.Now.AddHours(-topMinersRange);
 
-        response.Pool.TopMiners = (await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, pool.Id, from, 0, 15, ct)))
-            .Select(mapper.Map<MinerPerformanceStats>)
-            .ToArray();
+        var topMiners = await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, pool.Id, from, 0, 15, ct));
+        response.Pool.TopMiners = topMiners?.Select(mapper.Map<MinerPerformanceStats>).ToArray() ?? Array.Empty<MinerPerformanceStats>();
 
         return response;
     }
@@ -220,7 +271,7 @@ public class PoolApiController : ApiControllerBase
             state :
             new[] { BlockStatus.Confirmed, BlockStatus.Pending, BlockStatus.Orphaned };
 
-        var blocks = (await cf.Run(con => blocksRepo.PageBlocksAsync(con, pool.Id, blockStates, page, pageSize, ct)))
+        var blocks = (await cf.Run(con => blocksRepo.PageBlocksWithEffortAsync(con, pool.Id, blockStates, page, pageSize, ct)))
             .Select(mapper.Map<Responses.Block>)
             .ToArray();
 
@@ -243,6 +294,9 @@ public class PoolApiController : ApiControllerBase
                 }
             }
         }
+
+        await ethBlockEnricher.EnrichAsync(pool, blocks, ct);
+        await ApplyComputedBlockFieldsAsync(pool, blocks, ct);
 
         return blocks;
     }
@@ -260,7 +314,7 @@ public class PoolApiController : ApiControllerBase
 
         uint pageCount = (uint) Math.Floor((await cf.Run(con => blocksRepo.GetPoolBlockCountAsync(con, poolId, ct))) / (double) pageSize);
 
-        var blocks = (await cf.Run(con => blocksRepo.PageBlocksAsync(con, pool.Id, blockStates, page, pageSize, ct)))
+        var blocks = (await cf.Run(con => blocksRepo.PageBlocksWithEffortAsync(con, pool.Id, blockStates, page, pageSize, ct)))
             .Select(mapper.Map<Responses.Block>)
             .ToArray();
 
@@ -284,8 +338,99 @@ public class PoolApiController : ApiControllerBase
             }
         }
 
+        await ethBlockEnricher.EnrichAsync(pool, blocks, ct);
+        await ApplyComputedBlockFieldsAsync(pool, blocks, ct);
+
         var response = new PagedResultResponse<Responses.Block[]>(blocks, pageCount);
         return response;
+    }
+
+    private async Task ApplyComputedBlockFieldsAsync(PoolConfig pool, Responses.Block[] blocks, CancellationToken ct)
+    {
+        if(blocks == null || blocks.Length == 0 || pool?.Template == null)
+            return;
+
+        try
+        {
+            ulong? tipHeight = null;
+            int requiredConfirmations = 64;
+
+            if(pool.Template.Family == CoinFamily.Ethereum)
+            {
+                tipHeight = await ethBlockEnricher.GetChainTipHeightAsync(pool, ct);
+
+                var extraPoolConfig = pool.Extra.SafeExtensionDataAs<EthereumPoolConfigExtra>();
+                if(extraPoolConfig?.BlockConfirmations != null)
+                    requiredConfirmations = extraPoolConfig.BlockConfirmations.Value;
+            }
+
+            if(requiredConfirmations < 0)
+                requiredConfirmations = 0;
+
+            var isEthernova = string.Equals(pool.Coin, "ethernova", StringComparison.OrdinalIgnoreCase) ||
+                              string.Equals(pool.Template.Symbol, "NOVA", StringComparison.OrdinalIgnoreCase);
+
+            foreach(var block in blocks)
+            {
+                if(block == null)
+                    continue;
+
+                // Fill confirmationProgress (0..1) even when payment processing is disabled
+                if(tipHeight.HasValue)
+                {
+                    var confirmations = tipHeight.Value > block.BlockHeight ? (tipHeight.Value - block.BlockHeight) : 0UL;
+
+                    double computedProgress;
+                    if(requiredConfirmations == 0)
+                        computedProgress = 1.0d;
+                    else
+                        computedProgress = Math.Min(1.0d, confirmations / (double) requiredConfirmations);
+
+                    if(double.IsFinite(computedProgress))
+                    {
+                        if(!double.IsFinite(block.ConfirmationProgress) || block.ConfirmationProgress < computedProgress)
+                            block.ConfirmationProgress = computedProgress;
+                    }
+                }
+
+                // Fill base reward for pending blocks (no fees) for Ethernova/NOVA
+                if(isEthernova)
+                {
+                    var statusLower = (block.Status ?? string.Empty).ToLowerInvariant();
+                    var typeLower = (block.Type ?? string.Empty).ToLowerInvariant();
+
+                    var isUncle = typeLower == EthereumConstants.BlockTypeUncle;
+                    var isOrphaned = statusLower == "orphaned";
+
+                    if(!isOrphaned && !isUncle && block.Reward <= 0m)
+                        block.Reward = GetEthernovaBaseReward(block.BlockHeight);
+                }
+            }
+        }
+
+        catch(Exception ex)
+        {
+            logger.Warn(ex, () => $"Error computing confirmationProgress/reward for pool {pool?.Id}");
+        }
+    }
+
+    private static decimal GetEthernovaBaseReward(ulong blockHeight)
+    {
+        // Ethernova Monetary Policy (base reward, excludes tx fees)
+        // height >= 0:         10.0
+        // height >= 2,102,400:  5.0
+        // height >= 4,204,800:  2.5
+        // height >= 6,307,200:  1.25
+        // height >= 8,409,600:  1.0
+        if(blockHeight >= 8409600)
+            return 1.0m;
+        if(blockHeight >= 6307200)
+            return 1.25m;
+        if(blockHeight >= 4204800)
+            return 2.5m;
+        if(blockHeight >= 2102400)
+            return 5.0m;
+        return 10.0m;
     }
 
     [HttpGet("{poolId}/payments")]

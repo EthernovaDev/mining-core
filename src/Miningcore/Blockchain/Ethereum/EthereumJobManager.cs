@@ -248,6 +248,19 @@ public class EthereumJobManager : JobManagerBase<EthereumJob>
     {
         try
         {
+            static bool TryParseHexUlong(string value, out ulong result)
+            {
+                result = 0;
+
+                if(string.IsNullOrEmpty(value))
+                    return false;
+
+                if(value.StartsWith("0x", StringComparison.OrdinalIgnoreCase))
+                    value = value[2..];
+
+                return ulong.TryParse(value, NumberStyles.AllowHexSpecifier, CultureInfo.InvariantCulture, out result);
+            }
+
             var requests = new[]
             {
                 new RpcRequest(EC.GetPeerCount),
@@ -256,33 +269,98 @@ public class EthereumJobManager : JobManagerBase<EthereumJob>
 
             var responses = await rpc.ExecuteBatchAsync(logger, ct, requests);
 
-            if(responses.Any(x => x.Error != null))
+            if(responses == null || responses.Length < 2)
             {
-                var errors = responses.Where(x => x.Error != null)
-                    .ToArray();
-
-                if(errors.Any())
-                    logger.Warn(() => $"Error(s) refreshing network stats: {string.Join(", ", errors.Select(y => y.Error.Message))})");
+                logger.Warn(() => "Error refreshing network stats: missing RPC responses");
+                return;
             }
 
-            // extract results
-            var peerCount = responses[0].Response.ToObject<string>().IntegralFromHex<int>();
-            var blockInfo = responses[1].Response.ToObject<Block>();
+            // extract peerCount (best-effort)
+            var peerCount = BlockchainStats.ConnectedPeers;
 
-            var latestBlockHeight = blockInfo!.Height.Value;
+            try
+            {
+                if(responses[0].Error != null)
+                    logger.Warn(() => $"Error(s) refreshing network stats: {responses[0].Error.Message}");
+                else
+                {
+                    var peerCountHex = responses[0].Response?.ToObject<string>();
+
+                    if(TryParseHexUlong(peerCountHex, out var peers))
+                        peerCount = (int) Math.Min(peers, int.MaxValue);
+                }
+            }
+
+            catch(Exception ex)
+            {
+                logger.Warn(ex, () => "Error parsing peerCount while refreshing network stats");
+            }
+
+            BlockchainStats.ConnectedPeers = peerCount;
+
+            // extract latest block
+            if(responses[1].Error != null)
+            {
+                logger.Warn(() => $"Error(s) refreshing network stats: {responses[1].Error.Message}");
+                return;
+            }
+
+            var blockInfo = responses[1].Response?.ToObject<Block>();
+
+            if(blockInfo?.Height == null)
+            {
+                logger.Warn(() => "Error refreshing network stats: latest block or height was null");
+                BlockchainStats.NetworkHashrate = 0;
+                return;
+            }
+
+            if(!TryParseHexUlong(blockInfo.Difficulty, out var latestBlockDifficulty))
+            {
+                logger.Warn(() => "Error refreshing network stats: latest block difficulty missing/invalid");
+                return;
+            }
+
+            var latestBlockHeight = blockInfo.Height.Value;
             var latestBlockTimestamp = blockInfo.Timestamp;
-            var latestBlockDifficulty = blockInfo.Difficulty.IntegralFromHex<ulong>();
 
-            var sampleSize = (ulong) 300;
+            // Estimate network hashrate from a bounded sample window.
+            // On fresh chains, latest height can be < sampleSize; avoid ulong underflow and invalid RPC calls.
+            var sampleSize = Math.Min((ulong) 300, latestBlockHeight);
+
+            if(sampleSize == 0)
+            {
+                BlockchainStats.NetworkHashrate = 0;
+                return;
+            }
+
             var sampleBlockNumber = latestBlockHeight - sampleSize;
             var sampleBlockResults = await rpc.ExecuteAsync<Block>(logger, EC.GetBlockByNumber, ct, new[] { (object) sampleBlockNumber.ToStringHexWithPrefix(), true });
-            var sampleBlockTimestamp = sampleBlockResults.Response.Timestamp;
 
-            var blockTime = (double) (latestBlockTimestamp - sampleBlockTimestamp) / sampleSize;
+            if(sampleBlockResults.Error != null)
+            {
+                logger.Warn(() => $"Error(s) refreshing network stats: {sampleBlockResults.Error.Message}");
+                return;
+            }
+
+            var sampleBlock = sampleBlockResults.Response;
+            if(sampleBlock == null)
+            {
+                logger.Warn(() => "Error refreshing network stats: sample block was null");
+                return;
+            }
+
+            var sampleBlockTimestamp = sampleBlock.Timestamp;
+            var elapsed = latestBlockTimestamp > sampleBlockTimestamp ? latestBlockTimestamp - sampleBlockTimestamp : 0;
+            var blockTime = (double) elapsed / sampleSize;
+
+            if(blockTime <= 0)
+            {
+                BlockchainStats.NetworkHashrate = 0;
+                return;
+            }
+
             var networkHashrate = latestBlockDifficulty / blockTime;
-
-            BlockchainStats.NetworkHashrate = blockTime > 0 ? networkHashrate : 0;
-            BlockchainStats.ConnectedPeers = peerCount;
+            BlockchainStats.NetworkHashrate = double.IsFinite(networkHashrate) ? networkHashrate : 0;
         }
 
         catch(Exception e)
@@ -478,7 +556,7 @@ public class EthereumJobManager : JobManagerBase<EthereumJob>
     {
         var response = await rpc.ExecuteAsync<string>(logger, EC.GetPeerCount, ct);
 
-        return response.Error == null && response.Response.IntegralFromHex<uint>() > 0;
+        return response.Error == null;
     }
 
     protected override async Task EnsureDaemonsSynchedAsync(CancellationToken ct)

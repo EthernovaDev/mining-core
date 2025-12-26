@@ -166,6 +166,12 @@ public class PayoutManager : BackgroundService
                     if(!block.Effort.HasValue)  // fill block effort if empty
                         await CalculateBlockEffortAsync(pool, poolConfig, block, handler, ct);
 
+                    if(block.Status == BlockStatus.Confirmed && !block.Effort.HasValue)
+                    {
+                        logger.Warn(() => $"[{poolConfig.Id}] Confirmed block {block.BlockHeight} missing effort; defaulting to 0");
+                        block.Effort = 0;
+                    }
+
                     switch(block.Status)
                     {
                         case BlockStatus.Confirmed:

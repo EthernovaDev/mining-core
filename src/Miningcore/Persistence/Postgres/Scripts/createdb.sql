@@ -32,10 +32,11 @@ CREATE TABLE blocks
 	miner TEXT NULL,
 	reward decimal(28,12) NULL,
     source TEXT NULL,
-    hash TEXT NULL,
+	hash TEXT NULL,
 	created TIMESTAMPTZ NOT NULL,
 
-    CONSTRAINT BLOCKS_POOL_HEIGHT UNIQUE (poolid, blockheight, type) DEFERRABLE INITIALLY DEFERRED
+    CONSTRAINT BLOCKS_POOL_HEIGHT UNIQUE (poolid, blockheight, type) DEFERRABLE INITIALLY DEFERRED,
+    CONSTRAINT UQ_BLOCKS_POOLID_HEIGHT UNIQUE (poolid, blockheight)
 );
 
 CREATE INDEX IDX_BLOCKS_POOL_BLOCK_STATUS on blocks(poolid, blockheight, status);

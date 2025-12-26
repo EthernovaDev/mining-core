@@ -16,4 +16,15 @@ public class Block
     public string Miner { get; set; }
     public string Source { get; set; }
     public DateTime Created { get; set; }
+
+    // Optional enrichment (eg. Ethash via eth_getBlockByNumber)
+    public double? BlockDifficulty { get; set; }
+    public DateTime? BlockTimestamp { get; set; }
+    public double? BlockTimeSeconds { get; set; }
+    public int? TxCount { get; set; }
+    public string BlockMiner { get; set; }
+    public long? GasUsed { get; set; }
+    public long? GasLimit { get; set; }
+    public long? BaseFeePerGas { get; set; }
+    public long? BlockSizeBytes { get; set; }
 }

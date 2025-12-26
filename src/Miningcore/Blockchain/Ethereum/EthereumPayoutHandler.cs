@@ -52,6 +52,7 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
     private GethChainType chainType;
     private EthereumPoolConfigExtra extraPoolConfig;
     private EthereumPoolPaymentProcessingConfigExtra extraConfig;
+    private bool isEthernovaPool;
 
     protected override string LogCategory => "Ethereum Payout Handler";
 
@@ -63,6 +64,8 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
         clusterConfig = cc;
         extraPoolConfig = pc.Extra.SafeExtensionDataAs<EthereumPoolConfigExtra>();
         extraConfig = pc.PaymentProcessing.Extra.SafeExtensionDataAs<EthereumPoolPaymentProcessingConfigExtra>();
+        isEthernovaPool = string.Equals(pc?.Coin, "ethernova", StringComparison.OrdinalIgnoreCase) ||
+                          string.Equals(pc?.Template?.Symbol, "NOVA", StringComparison.OrdinalIgnoreCase);
 
         logger = LogUtil.GetPoolScopedLogger(typeof(EthereumPayoutHandler), pc);
 
@@ -131,11 +134,14 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
                         block.Status = BlockStatus.Confirmed;
                         block.ConfirmationProgress = 1;
                         block.BlockHeight = (ulong) blockInfo.Height;
-                        block.Reward = GetBaseBlockReward(chainType, block.BlockHeight); // base reward
+                        block.Reward = GetBaseBlockRewardForPool(block.BlockHeight); // base reward
                         block.Type = EthereumConstants.BlockTypeBlock;
 
                         if(extraConfig?.KeepUncles == false)
-                            block.Reward += blockInfo.Uncles.Length * (block.Reward / 32); // uncle rewards
+                        {
+                            var uncleCount = blockInfo.Uncles?.Length ?? 0;
+                            block.Reward += uncleCount * (block.Reward / 32); // uncle rewards
+                        }
 
                         if(extraConfig?.KeepTransactionFees == false && blockInfo.Transactions?.Length > 0)
                             block.Reward += await GetTxRewardAsync(blockInfo, ct) - burnedFee;
@@ -149,7 +155,7 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
                 }
 
                 // search for a block containing our block as an uncle by checking N blocks in either direction
-                var heightMin = block.BlockHeight - extraConfig.BlockSearchOffset;
+                var heightMin = block.BlockHeight > extraConfig.BlockSearchOffset ? block.BlockHeight - extraConfig.BlockSearchOffset : 0;
                 var heightMax = Math.Min(block.BlockHeight + extraConfig.BlockSearchOffset, latestBlockHeight);
                 var range = new List<long>();
 
@@ -162,7 +168,7 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
                 foreach(var blockInfo2 in blockInfo2s)
                 {
                     // don't give up yet, there might be an uncle
-                    if(blockInfo2.Uncles.Length > 0)
+                    if(blockInfo2.Uncles?.Length > 0)
                     {
                         // fetch all uncles in a single RPC batch request
                         var uncleBatch = blockInfo2.Uncles.Select((x, index) => new RpcRequest(EC.GetUncleByBlockNumberAndIndex,
@@ -183,7 +189,7 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
                         {
                             // mature?
                             if(block.Reward == 0)
-                                block.Reward = GetUncleReward(chainType, uncle.Height.Value, blockInfo2.Height.Value);
+                                block.Reward = GetUncleRewardForPool(uncle.Height.Value, blockInfo2.Height.Value);
 
                             if(latestBlockHeight - uncle.Height.Value >= EthereumConstants.MinConfimations)
                             {
@@ -195,13 +201,13 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
                                 // uncles from that block and continue searching if there any others.
                                 // Otherwise the payouter will crash and no further blocks will be unlocked.
                                 var duplBlock = await cf.Run(con => blockRepo.GetBlockByHeightAsync(con, poolConfig.Id, Convert.ToInt64(uncle.Height.Value)));
-                                if(duplBlock != null && duplBlock.Type == EthereumConstants.BlockTypeUncle)
+                                if(duplBlock != null && duplBlock.Id != block.Id)
                                 {
-                                    logger.Info(() => $"[{LogCategory}] Found another uncle from block {uncle.Height.Value} in the DB. Continuing search for uncle.");
+                                    logger.Info(() => $"[{LogCategory}] Found another block at height {uncle.Height.Value} in the DB (id={duplBlock.Id}, type={duplBlock.Type ?? "n/a"}). Continuing search for uncle.");
                                     continue;
                                 }
 
-                                block.Reward = GetUncleReward(chainType, uncle.Height.Value, blockInfo2.Height.Value);
+                                block.Reward = GetUncleRewardForPool(uncle.Height.Value, blockInfo2.Height.Value);
                                 block.Status = BlockStatus.Confirmed;
                                 block.ConfirmationProgress = 1;
                                 block.BlockHeight = uncle.Height.Value;
@@ -340,6 +346,46 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
             default:
                 throw new Exception("Unable to determine block reward: Unsupported chain type");
         }
+    }
+
+    internal static decimal GetEthernovaBaseReward(ulong height)
+    {
+        // Ethernova Monetary Policy (base reward, excludes tx fees)
+        // height >= 0:         10.0
+        // height >= 2,102,400:  5.0
+        // height >= 4,204,800:  2.5
+        // height >= 6,307,200:  1.25
+        // height >= 8,409,600:  1.0
+        if(height >= 8409600)
+            return 1.0m;
+        if(height >= 6307200)
+            return 1.25m;
+        if(height >= 4204800)
+            return 2.5m;
+        if(height >= 2102400)
+            return 5.0m;
+        return 10.0m;
+    }
+
+    private decimal GetBaseBlockRewardForPool(ulong height)
+    {
+        if(isEthernovaPool)
+            return GetEthernovaBaseReward(height);
+
+        return GetBaseBlockReward(chainType, height);
+    }
+
+    private decimal GetUncleRewardForPool(ulong uheight, ulong height)
+    {
+        if(isEthernovaPool)
+        {
+            var reward = GetEthernovaBaseReward(height);
+            reward *= uheight + 8 - height;
+            reward /= 8m;
+            return reward;
+        }
+
+        return GetUncleReward(chainType, uheight, height);
     }
 
     private async Task<decimal> GetTxRewardAsync(DaemonResponses.Block blockInfo, CancellationToken ct)

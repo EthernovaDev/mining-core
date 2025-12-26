@@ -4274,6 +4274,17 @@
         "explorerTxLink": "https://etherscan.io/tx/{0}",
         "explorerAccountLink": "https://etherscan.io/address/{0}"
     },
+    "ethernova": {
+        "name": "Ethernova",
+        "canonicalName": "Ethernova",
+        "symbol": "NOVA",
+        "family": "ethereum",
+        "website": "",
+        "market": "",
+        "twitter": "",
+        "telegram": "",
+        "discord": ""
+    },
     "ethereum-pow": {
         "name": "EthereumPoW",
         "canonicalName": "EthereumPoW",

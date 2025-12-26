@@ -18,7 +18,13 @@ public static class EthereumUtils
             networkType = EthereumNetworkType.Unknown;
 
         // convert chain
-        if(!Enum.TryParse(gethChainResponse, true, out chainType))
+        var chain = gethChainResponse;
+
+        // Historically used by configs and other components as alias for Ethereum main chain
+        if(string.Equals(chain, "Ethereum", StringComparison.OrdinalIgnoreCase))
+            chain = nameof(GethChainType.Main);
+
+        if(!Enum.TryParse(chain, true, out chainType))
         {
             chainType = GethChainType.Unknown;
         }

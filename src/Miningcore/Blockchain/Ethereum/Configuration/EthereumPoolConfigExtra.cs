@@ -18,4 +18,9 @@ public class EthereumPoolConfigExtra
     /// getWork stream published via ZMQ
     /// </summary>
     public ZmqPubSubEndpointConfig BtStream { get; set; }
+
+    /// <summary>
+    /// Block confirmations required for maturity/progress calculations (used for API/UI even if paymentProcessing is disabled)
+    /// </summary>
+    public int? BlockConfirmations { get; set; }
 }

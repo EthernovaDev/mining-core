@@ -120,7 +120,7 @@ public abstract class PayoutHandlerBase
                 {
                     foreach(var balance in balances)
                     {
-                        if(!string.IsNullOrEmpty(transactionConfirmation) && poolConfig.RewardRecipients.All(x => x.Address != balance.Address))
+                        if(ShouldRecordPayment(balance.Address, transactionConfirmation))
                         {
                             // record payment
                             var payment = new Payment
@@ -169,7 +169,7 @@ public abstract class PayoutHandlerBase
                     {
                         var (balance, transactionConfirmation) = kvp;
 
-                        if(!string.IsNullOrEmpty(transactionConfirmation) && poolConfig.RewardRecipients.All(x => x.Address != balance.Address))
+                        if(ShouldRecordPayment(balance.Address, transactionConfirmation))
                         {
                             // record payment
                             var payment = new Payment
@@ -204,6 +204,21 @@ public abstract class PayoutHandlerBase
     public virtual double AdjustShareDifficulty(double difficulty)
     {
         return difficulty;
+    }
+
+    private bool ShouldRecordPayment(string address, string txConfirmation)
+    {
+        if(string.IsNullOrEmpty(txConfirmation))
+            return false;
+
+        if(string.Equals(address, poolConfig.Address, StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        var recipients = poolConfig.RewardRecipients;
+        if(recipients == null || recipients.Length == 0)
+            return true;
+
+        return recipients.All(x => !string.Equals(x.Address, address, StringComparison.OrdinalIgnoreCase));
     }
 
     public string FormatAmount(decimal amount)

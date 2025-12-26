@@ -23,7 +23,25 @@ public class BlockRepository : IBlockRepository
             @"INSERT INTO blocks(poolid, blockheight, networkdifficulty, status, type, transactionconfirmationdata,
                 miner, reward, effort, confirmationprogress, source, hash, created)
             VALUES(@poolid, @blockheight, @networkdifficulty, @status, @type, @transactionconfirmationdata,
-                @miner, @reward, @effort, @confirmationprogress, @source, @hash, @created)";
+                @miner, @reward, @effort, @confirmationprogress, @source, @hash, @created)
+            ON CONFLICT (poolid, blockheight) DO UPDATE SET
+                networkdifficulty = EXCLUDED.networkdifficulty,
+                status = CASE
+                    WHEN blocks.status IN ('confirmed', 'orphaned') THEN blocks.status
+                    ELSE EXCLUDED.status
+                END,
+                type = COALESCE(EXCLUDED.type, blocks.type),
+                transactionconfirmationdata = CASE
+                    WHEN EXCLUDED.transactionconfirmationdata <> '' THEN EXCLUDED.transactionconfirmationdata
+                    ELSE blocks.transactionconfirmationdata
+                END,
+                miner = COALESCE(EXCLUDED.miner, blocks.miner),
+                reward = COALESCE(EXCLUDED.reward, blocks.reward),
+                effort = COALESCE(EXCLUDED.effort, blocks.effort),
+                confirmationprogress = GREATEST(blocks.confirmationprogress, EXCLUDED.confirmationprogress),
+                source = COALESCE(EXCLUDED.source, blocks.source),
+                hash = COALESCE(NULLIF(EXCLUDED.hash, ''), blocks.hash),
+                created = GREATEST(blocks.created, EXCLUDED.created)";
 
         await con.ExecuteAsync(query, mapped, tx);
     }
@@ -39,7 +57,7 @@ public class BlockRepository : IBlockRepository
         var mapped = mapper.Map<Entities.Block>(block);
 
         const string query = @"UPDATE blocks SET blockheight = @blockheight, status = @status, type = @type,
-            reward = @reward, effort = @effort, confirmationprogress = @confirmationprogress, hash = @hash WHERE id = @id";
+            reward = @reward, effort = COALESCE(@effort, effort), confirmationprogress = @confirmationprogress, hash = @hash WHERE id = @id";
 
         await con.ExecuteAsync(query, mapped, tx);
     }
@@ -56,6 +74,79 @@ public class BlockRepository : IBlockRepository
             status = status.Select(x => x.ToString().ToLower()).ToArray(),
             offset = page * pageSize,
             pageSize
+        }, cancellationToken: ct)))
+            .Select(mapper.Map<Block>)
+            .ToArray();
+    }
+
+    public async Task<Block[]> PageBlocksWithEffortAsync(IDbConnection con, string poolId, BlockStatus[] status,
+        int page, int pageSize, CancellationToken ct)
+    {
+        const string query = @"
+WITH dedup AS (
+    SELECT b.*,
+           ROW_NUMBER() OVER (PARTITION BY b.poolid, b.blockheight ORDER BY b.created DESC, b.id DESC) AS rn
+    FROM blocks b
+    WHERE b.poolid = @poolId
+      AND b.status = ANY(@status)
+),
+blocks_unique AS (
+    SELECT *
+    FROM dedup
+    WHERE rn = 1
+),
+paged AS (
+    SELECT *
+    FROM blocks_unique
+    ORDER BY created DESC, id DESC
+    OFFSET @offset
+    LIMIT @pageSizePlusOne
+),
+with_prev AS (
+    SELECT p.*,
+           LEAD(p.created) OVER (ORDER BY p.created DESC, p.id DESC) AS prev_created
+    FROM paged p
+)
+SELECT
+    w.id,
+    w.poolid,
+    w.blockheight,
+    w.networkdifficulty,
+    w.status,
+    w.type,
+    w.confirmationprogress,
+    COALESCE(
+        CASE
+            WHEN w.prev_created IS NULL THEN NULL
+            WHEN w.networkdifficulty IS NULL OR w.networkdifficulty <= 0 THEN NULL
+            ELSE (
+                SELECT SUM(s.difficulty)
+                FROM shares s
+                WHERE s.poolid = w.poolid
+                  AND s.created > w.prev_created
+                  AND s.created <= w.created
+            ) / w.networkdifficulty
+        END,
+        w.effort,
+        0
+    ) AS effort,
+    w.transactionconfirmationdata,
+    w.miner,
+    w.reward,
+    w.source,
+    w.hash,
+    w.created
+FROM with_prev w
+ORDER BY w.created DESC, w.id DESC
+LIMIT @pageSize;";
+
+        return (await con.QueryAsync<Entities.Block>(new CommandDefinition(query, new
+        {
+            poolId,
+            status = status.Select(x => x.ToString().ToLower()).ToArray(),
+            offset = page * pageSize,
+            pageSize,
+            pageSizePlusOne = pageSize + 1,
         }, cancellationToken: ct)))
             .Select(mapper.Map<Block>)
             .ToArray();
