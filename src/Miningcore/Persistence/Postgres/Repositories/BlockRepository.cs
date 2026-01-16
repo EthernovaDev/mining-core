@@ -56,7 +56,12 @@ public class BlockRepository : IBlockRepository
     {
         var mapped = mapper.Map<Entities.Block>(block);
 
-        const string query = @"UPDATE blocks SET blockheight = @blockheight, status = @status, type = @type,
+        const string query = @"UPDATE blocks SET blockheight = CASE
+                WHEN EXISTS (SELECT 1 FROM blocks b2 WHERE b2.poolid = @poolid AND b2.blockheight = @blockheight AND b2.id <> @id)
+                    THEN blocks.blockheight
+                ELSE @blockheight
+            END,
+            status = @status, type = @type,
             reward = @reward, effort = COALESCE(@effort, effort), confirmationprogress = @confirmationprogress, hash = @hash WHERE id = @id";
 
         await con.ExecuteAsync(query, mapped, tx);

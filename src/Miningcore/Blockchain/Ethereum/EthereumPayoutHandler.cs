@@ -98,7 +98,14 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
 
             // get latest block
             var latestBlockResponse = await rpcClient.ExecuteAsync<DaemonResponses.Block>(logger, EC.GetBlockByNumber, ct, new[] { (object) "latest", true });
-            var latestBlockHeight = latestBlockResponse.Response.Height.Value;
+            var latestBlock = latestBlockResponse.Response;
+
+            if(latestBlock?.Height == null)
+            {
+                logger.Warn(() => $"[{LogCategory}] Failed to fetch latest block header for payout processing");
+                continue;
+            }
+            var latestBlockHeight = latestBlock.Height.Value;
 
             // execute batch
             var blockInfos = await FetchBlocks(blockCache, ct, page.Select(block => (long) block.BlockHeight).ToArray());
@@ -107,6 +114,12 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
             {
                 var blockInfo = blockInfos[j];
                 var block = page[j];
+
+                if(blockInfo?.Height == null)
+                {
+                    logger.Warn(() => $"[{LogCategory}] Missing block info for height {block.BlockHeight}, deferring");
+                    continue;
+                }
 
                 // update progress
                 block.ConfirmationProgress = Math.Min(1.0d, (double) (latestBlockHeight - block.BlockHeight) / EthereumConstants.MinConfimations);
@@ -122,9 +135,24 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
                     {
                         var blockHashResponse = await rpcClient.ExecuteAsync<DaemonResponses.Block>(logger, EC.GetBlockByNumber, ct,
                             new[] { (object) block.BlockHeight.ToStringHexWithPrefix(), true });
-                        var blockHash = blockHashResponse.Response.Hash;
-                        var baseGas = blockHashResponse.Response.BaseFeePerGas;
-                        var gasUsed = blockHashResponse.Response.GasUsed;
+                        var blockHashInfo = blockHashResponse.Response;
+                        if(blockHashInfo?.Hash == null)
+                        {
+                            logger.Warn(() => $"[{LogCategory}] Missing block header for height {block.BlockHeight}, deferring");
+                            continue;
+                        }
+
+                        var duplBlock = await cf.Run(con =>
+                            blockRepo.GetBlockByHeightAsync(con, poolConfig.Id, Convert.ToInt64(blockInfo.Height.Value)));
+                        if(duplBlock != null && duplBlock.Id != block.Id)
+                        {
+                            logger.Warn(() => $"[{LogCategory}] Found another block at height {blockInfo.Height.Value} in the DB (id={duplBlock.Id}, type={duplBlock.Type ?? "n/a"}). Deferring.");
+                            continue;
+                        }
+
+                        var blockHash = blockHashInfo.Hash;
+                        var baseGas = blockHashInfo.BaseFeePerGas;
+                        var gasUsed = blockHashInfo.GasUsed;
 
                         var burnedFee = (decimal) 0;
                         if(extraPoolConfig?.ChainTypeOverride == "Ethereum" || extraPoolConfig?.ChainTypeOverride == "Main" || extraPoolConfig?.ChainTypeOverride == "MainPow" || extraPoolConfig?.ChainTypeOverride == "EtherOne" || extraPoolConfig?.ChainTypeOverride == "Pink")
@@ -167,6 +195,9 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
 
                 foreach(var blockInfo2 in blockInfo2s)
                 {
+                    if(blockInfo2?.Height == null)
+                        continue;
+
                     // don't give up yet, there might be an uncle
                     if(blockInfo2.Uncles?.Length > 0)
                     {
@@ -318,7 +349,8 @@ public class EthereumPayoutHandler : PayoutHandlerBase,
                 blockCache[(long) block.Height.Value] = block;
         }
 
-        return blockHeights.Select(x => blockCache[x]).ToArray();
+            return blockHeights.Select(x =>
+                blockCache.TryGetValue(x, out var block) ? block : null).ToArray();
     }
 
     internal static decimal GetBaseBlockReward(GethChainType chainType, ulong height)

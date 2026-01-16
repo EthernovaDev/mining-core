@@ -1,6 +1,7 @@
 using System.Reactive;
 using System.Reactive.Linq;
 using System.Reactive.Threading.Tasks;
+using System.Text;
 using Autofac;
 using AutoMapper;
 using Microsoft.IO;
@@ -37,6 +38,8 @@ public class EthereumPool : PoolBase
 
     private EthereumJobManager manager;
     private EthereumCoinTemplate coin;
+    private const string DefaultWorkerName = "default";
+    private const int MaxWorkerNameLength = 32;
 
     #region // Protocol V2 handlers - https://github.com/nicehash/Specifications/blob/master/EthereumStratum_NiceHash_v1.0.0.txt
 
@@ -93,15 +96,11 @@ public class EthereumPool : PoolBase
         if(request.Id == null)
             throw new StratumException(StratumError.MinusOne, "missing request id");
 
-        var requestParams = request.ParamsAs<string[]>();
-        var workerValue = requestParams?.Length > 0 ? requestParams[0] : "0";
-        var password = requestParams?.Length > 1 ? requestParams[1] : null;
+        var (rawLogin, password) = ExtractLoginAndPassword(request);
         var passParts = password?.Split(PasswordControlVarsSeparator);
 
         // extract worker/miner
-        var workerParts = workerValue?.Split('.');
-        var minerName = workerParts?.Length > 0 ? workerParts[0].Trim() : null;
-        var workerName = workerParts?.Length > 1 ? workerParts[1].Trim() : "0";
+        var (minerName, workerName) = ParseWorkerValue(rawLogin, password);
 
         context.IsAuthorized = manager.ValidateAddress(minerName);
 
@@ -110,7 +109,7 @@ public class EthereumPool : PoolBase
 
         if(context.IsAuthorized)
         {
-            context.Miner = minerName?.ToLower();
+            context.Miner = minerName?.ToLowerInvariant();
             context.Worker = workerName;
 
             // extract control vars from password
@@ -146,7 +145,6 @@ public class EthereumPool : PoolBase
             await connection.NotifyAsync(EthereumStratumMethods.SetDifficulty, new object[] { context.Difficulty });
             await connection.NotifyAsync(EthereumStratumMethods.MiningNotify, manager.GetJobParamsForStratum());
 
-            logger.Info(() => $"[{connection.ConnectionId}] Authorized worker {workerValue}");
         }
 
         else
@@ -263,19 +261,15 @@ public class EthereumPool : PoolBase
         if(request.Id == null)
             throw new StratumException(StratumError.Other, "missing request id");
 
-        var requestParams = request.ParamsAs<string[]>();
+        var (rawLogin, password) = ExtractLoginAndPassword(request);
 
-        if(requestParams?.Length < 1)
+        if(string.IsNullOrEmpty(rawLogin))
             throw new StratumException(StratumError.MinusOne, "invalid request");
 
-        var workerValue = requestParams?.Length > 0 ? requestParams[0] : "0";
-        var password = requestParams?.Length > 1 ? requestParams[1] : null;
         var passParts = password?.Split(PasswordControlVarsSeparator);
 
         // extract worker/miner
-        var workerParts = workerValue?.Split('.');
-        var minerName = workerParts?.Length > 0 ? workerParts[0].Trim() : null;
-        var workerName = workerParts?.Length > 1 ? workerParts[1].Trim() : "0";
+        var (minerName, workerName) = ParseWorkerValue(rawLogin, password);
 
         manager.PrepareWorker(connection);
 
@@ -286,7 +280,7 @@ public class EthereumPool : PoolBase
 
         if(context.IsAuthorized)
         {
-            context.Miner = minerName?.ToLower();
+            context.Miner = minerName?.ToLowerInvariant();
             context.Worker = workerName;
 
             // extract control vars from password
@@ -318,8 +312,6 @@ public class EthereumPool : PoolBase
 
                 logger.Info(() => $"[{connection.ConnectionId}] Setting static difficulty of {staticDiff.Value}");
             }
-
-            logger.Info(() => $"[{connection.ConnectionId}] Authorized worker {workerValue}");
 
             // setup worker context
             context.IsSubscribed = true;
@@ -412,9 +404,132 @@ public class EthereumPool : PoolBase
     private static string GetWorkerNameFromV1Request(JsonRpcRequest request, EthereumWorkerContext context)
     {
         if(request.Extra?.TryGetValue(EthereumConstants.RpcRequestWorkerPropertyName, out var tmp) == true && tmp is string workerNameValue)
-            return workerNameValue;
+            return NormalizeWorkerName(workerNameValue);
 
-        return context.Worker;
+        return NormalizeWorkerName(context.Worker);
+    }
+
+    private static (string Login, string Password) ExtractLoginAndPassword(JsonRpcRequest request)
+    {
+        if(request?.Params == null)
+            return (null, null);
+
+        switch(request.Params)
+        {
+            case string[] values:
+                return (values.Length > 0 ? values[0] : null, values.Length > 1 ? values[1] : null);
+            case object[] values:
+                return (values.Length > 0 ? values[0]?.ToString() : null, values.Length > 1 ? values[1]?.ToString() : null);
+            case string single:
+                return (single, null);
+        }
+
+        if(request.Params is Newtonsoft.Json.Linq.JToken token)
+            return ExtractLoginAndPasswordFromToken(token);
+
+        return (request.Params.ToString(), null);
+    }
+
+    private static (string Login, string Password) ExtractLoginAndPasswordFromToken(Newtonsoft.Json.Linq.JToken token)
+    {
+        if(token == null)
+            return (null, null);
+
+        if(token.Type == Newtonsoft.Json.Linq.JTokenType.Array && token is Newtonsoft.Json.Linq.JArray array)
+        {
+            var login = array.Count > 0 ? array[0]?.ToString() : null;
+            var password = array.Count > 1 ? array[1]?.ToString() : null;
+            return (login, password);
+        }
+
+        if(token.Type == Newtonsoft.Json.Linq.JTokenType.Object)
+        {
+            var login = token["login"] ?? token["user"] ?? token["username"] ?? token["wallet"] ?? token["address"];
+            var password = token["password"] ?? token["pass"] ?? token["pwd"];
+            return (login?.ToString(), password?.ToString());
+        }
+
+        if(token.Type == Newtonsoft.Json.Linq.JTokenType.String)
+            return (token.ToString(), null);
+
+        return (token.ToString(), null);
+    }
+
+    private static (string Miner, string Worker) ParseWorkerValue(string rawLogin, string password)
+    {
+        if(string.IsNullOrWhiteSpace(rawLogin))
+            return (null, DefaultWorkerName);
+
+        var trimmed = rawLogin.Trim();
+        var separatorIndex = trimmed.IndexOfAny(new[] { '.', '/', ':' });
+
+        if(separatorIndex <= 0)
+        {
+            var workerFromPassword = GetWorkerNameFromPassword(password);
+            return (trimmed, workerFromPassword ?? DefaultWorkerName);
+        }
+
+        var miner = trimmed.Substring(0, separatorIndex).Trim();
+        var worker = trimmed[(separatorIndex + 1)..].Trim();
+        return (miner, NormalizeWorkerName(worker));
+    }
+
+    private static string GetWorkerNameFromPassword(string password)
+    {
+        if(string.IsNullOrWhiteSpace(password))
+            return null;
+
+        var separatorIndex = password.IndexOf(PasswordControlVarsSeparator, StringComparison.Ordinal);
+        var candidate = separatorIndex >= 0 ? password.Substring(0, separatorIndex) : password;
+        var trimmed = candidate?.Trim();
+
+        if(string.IsNullOrWhiteSpace(trimmed))
+            return null;
+
+        if(IsPlaceholderPassword(trimmed))
+            return null;
+
+        return NormalizeWorkerName(trimmed);
+    }
+
+    private static bool IsPlaceholderPassword(string password)
+    {
+        if(string.IsNullOrWhiteSpace(password))
+            return true;
+
+        var trimmed = password.Trim();
+        return trimmed.Equals("x", StringComparison.OrdinalIgnoreCase) ||
+               trimmed == "0" ||
+               trimmed == "-";
+    }
+
+    private static string NormalizeWorkerName(string workerName)
+    {
+        if(string.IsNullOrWhiteSpace(workerName))
+            return DefaultWorkerName;
+
+        var trimmed = workerName.Trim();
+        if(trimmed == "0")
+            return DefaultWorkerName;
+
+        var sb = new StringBuilder(trimmed.Length);
+
+        foreach(var ch in trimmed)
+        {
+            if(sb.Length >= MaxWorkerNameLength)
+                break;
+
+            if((ch >= 'a' && ch <= 'z') ||
+               (ch >= 'A' && ch <= 'Z') ||
+               (ch >= '0' && ch <= '9') ||
+               ch == '_' || ch == '-')
+                sb.Append(ch);
+            else
+                sb.Append('_');
+        }
+
+        var sanitized = sb.ToString();
+        return string.IsNullOrEmpty(sanitized) ? DefaultWorkerName : sanitized;
     }
 
     protected virtual async Task OnNewJobAsync()

@@ -1,3 +1,15 @@
+# Ethernova (NOVA) Miningcore Operator Kit
+
+Start here: [operator-kit/README.md](operator-kit/README.md)
+
+- Algorithm: Ethash
+- Mainnet chainId/networkId: 121525 (chainId hex 0x1dab5)
+- RPC requirements: `eth_chainId`, `net_version`, `eth_blockNumber`, `eth_getBlockByNumber`, `eth_getBlockByHash`, `eth_getTransactionReceipt`
+- Ports: Stratum TCP (example 4073/4074), API 4000, CoreGeth RPC 8545 (WS 8546 optional)
+- Minimum payout default: 1.0 NOVA (`pools[].paymentProcessing.minimumPayment`)
+- No code changes required for block validation/payout; standard Ethereum flow
+
+[![Build status](https://ci.appveyor.com/api/projects/status/nbvaa55gu3icd1q8?svg=true)](https://ci.appveyor.com/project/oliverw/miningcore)
 [![.NET](https://github.com/oliverw/miningcore/actions/workflows/dotnet.yml/badge.svg)](https://github.com/oliverw/miningcore/actions/workflows/dotnet.yml)
 [![license](https://img.shields.io/github/license/mashape/apistatus.svg)]()
 

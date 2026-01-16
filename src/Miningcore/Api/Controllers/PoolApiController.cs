@@ -52,6 +52,7 @@ public class PoolApiController : ApiControllerBase
     private readonly EthereumBlockEnricher ethBlockEnricher;
 
     private static readonly ILogger logger = LogManager.GetCurrentClassLogger();
+    private const string DefaultWorkerName = "default";
 
     #region Actions
 
@@ -255,6 +256,65 @@ public class PoolApiController : ApiControllerBase
 
         var miners = (await cf.Run(con => statsRepo.PagePoolMinersByHashrateAsync(con, pool.Id, start, page, pageSize, ct)))
             .Select(mapper.Map<MinerPerformanceStats>)
+            .ToArray();
+
+        return miners;
+    }
+
+    [HttpGet("{poolId}/bestminers")]
+    public async Task<BestMinerStats[]> GetBestMinersAsync(
+        string poolId, [FromQuery] int limit = 20, [FromQuery] int activeWindow = 60)
+    {
+        var pool = GetPool(poolId);
+        var ct = HttpContext.RequestAborted;
+
+        if (limit <= 0)
+            return Array.Empty<BestMinerStats>();
+        if (limit > 100)
+            limit = 100;
+
+        if (activeWindow <= 0)
+            activeWindow = 15;
+        if (activeWindow > 3600)
+            activeWindow = 3600;
+
+        var now = clock.Now;
+        var window = TimeSpan.FromSeconds(activeWindow);
+        var start = now - window;
+        var windowSeconds = window.TotalSeconds;
+
+        pools.TryGetValue(pool.Id, out var poolInstance);
+
+        var hashes = await cf.Run(con => shareRepo.GetHashAccumulationBetweenAsync(con, pool.Id, start, now, ct));
+        if (hashes == null || hashes.Length == 0)
+            return Array.Empty<BestMinerStats>();
+
+        var miners = hashes
+            .GroupBy(x => x.Miner)
+            .Select(group =>
+            {
+                var sum = group.Sum(x => x.Sum);
+                var count = group.Sum(x => x.Count);
+                var lastShare = group.Max(x => x.LastShare);
+
+                var hashrate = 0d;
+                if (poolInstance != null && sum > 0 && windowSeconds > 0)
+                    hashrate = poolInstance.HashrateFromShares(sum, windowSeconds);
+
+                var sharesPerSecond = windowSeconds > 0 ? (count / windowSeconds) : 0d;
+
+                return new BestMinerStats
+                {
+                    Miner = group.Key,
+                    Hashrate = hashrate,
+                    SharesPerSecond = sharesPerSecond,
+                    LastSeen = lastShare
+                };
+            })
+            .Where(x => x.Hashrate > 0 && x.SharesPerSecond > 0 && (now - x.LastSeen).TotalSeconds <= activeWindow)
+            .OrderByDescending(x => x.Hashrate)
+            .ThenByDescending(x => x.SharesPerSecond)
+            .Take(limit)
             .ToArray();
 
         return miners;
@@ -507,7 +567,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         var statsResult = await cf.RunTx((con, tx) =>
             statsRepo.GetMinerStatsAsync(con, tx, pool.Id, address, ct), true, IsolationLevel.Serializable);
@@ -535,6 +595,13 @@ public class PoolApiController : ApiControllerBase
             }
 
             stats.PerformanceSamples = await GetMinerPerformanceInternal(perfMode, pool, address, ct);
+            NormalizeWorkerStats(stats.Performance);
+
+            if(stats.PerformanceSamples != null)
+            {
+                foreach(var sample in stats.PerformanceSamples)
+                    NormalizeWorkerStats(sample);
+            }
         }
 
         return stats;
@@ -551,7 +618,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         var payments = (await cf.Run(con => paymentsRepo.PagePaymentsAsync(
                 con, pool.Id, address, page, pageSize, ct)))
@@ -587,7 +654,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetPaymentsCountAsync(con, poolId, address, ct))) / (double) pageSize);
 
@@ -626,7 +693,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         var balanceChanges = (await cf.Run(con => paymentsRepo.PageBalanceChangesAsync(
                 con, pool.Id, address, page, pageSize, ct)))
@@ -647,7 +714,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetBalanceChangesCountAsync(con, poolId, address))) / (double) pageSize);
 
@@ -671,7 +738,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         var earnings = (await cf.Run(con => paymentsRepo.PageMinerPaymentsByDayAsync(
                 con, pool.Id, address, page, pageSize, ct)))
@@ -691,7 +758,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         uint pageCount = (uint) Math.Floor((await cf.Run(con => paymentsRepo.GetMinerPaymentsByDayCountAsync(con, poolId, address))) / (double) pageSize);
 
@@ -714,7 +781,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         var result = await GetMinerPerformanceInternal(mode, pool, address, ct);
 
@@ -730,7 +797,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         var result = await cf.Run(con=> minerRepo.GetSettingsAsync(con, null, pool.Id, address));
 
@@ -750,7 +817,7 @@ public class PoolApiController : ApiControllerBase
             throw new ApiException("Invalid or missing miner address", HttpStatusCode.NotFound);
 
         if(pool.Template.Family == CoinFamily.Ethereum)
-            address = address.ToLower();
+            address = address.ToLowerInvariant();
 
         if(request?.Settings == null)
             throw new ApiException("Invalid or missing settings", HttpStatusCode.BadRequest);
@@ -838,6 +905,48 @@ public class PoolApiController : ApiControllerBase
 
         // map
         var result = mapper.Map<Responses.WorkerPerformanceStatsContainer[]>(stats);
+
+        if(result != null)
+        {
+            foreach(var sample in result)
+                NormalizeWorkerStats(sample);
+        }
+
         return result;
+    }
+
+    private static void NormalizeWorkerStats(Responses.WorkerPerformanceStatsContainer container)
+    {
+        if(container?.Workers == null || container.Workers.Count == 0)
+            return;
+
+        var normalized = new Dictionary<string, Responses.WorkerPerformanceStats>(StringComparer.Ordinal);
+
+        foreach(var entry in container.Workers)
+        {
+            var key = NormalizeWorkerKey(entry.Key);
+            var value = entry.Value ?? new Responses.WorkerPerformanceStats();
+
+            if(normalized.TryGetValue(key, out var existing))
+            {
+                normalized[key] = new Responses.WorkerPerformanceStats
+                {
+                    Hashrate = existing.Hashrate + value.Hashrate,
+                    SharesPerSecond = existing.SharesPerSecond + value.SharesPerSecond
+                };
+            }
+            else
+                normalized[key] = value;
+        }
+
+        container.Workers = normalized;
+    }
+
+    private static string NormalizeWorkerKey(string worker)
+    {
+        if(string.IsNullOrWhiteSpace(worker) || worker == "0")
+            return DefaultWorkerName;
+
+        return worker;
     }
 }
