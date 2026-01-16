@@ -44,10 +44,12 @@ cp operator-kit/miningcore-config-nova-pool.json /etc/miningcore/config.json
 
 3) Ensure the NOVA coin template is available:
 - This fork already includes `ethernova` in `src/Miningcore/coins.json`.
-- Copy it to `/etc/miningcore/coins.json` and keep the config pointing to it:
+- Recommended: copy it to `/etc/miningcore/coins.json`:
 ```
-cp /path/to/miningcore/build/coins.json /etc/miningcore/coins.json
+cp /path/to/miningcore/src/Miningcore/coins.json /etc/miningcore/coins.json
 ```
+- Miningcore loads coin templates from `coinTemplates` in `config.json`. Use:
+  - `"coinTemplates": ["/etc/miningcore/coins.json"]`
 
 4) Edit `/etc/miningcore/config.json`:
 - `pools[].id`: `nova1`
@@ -105,13 +107,13 @@ Expected:
 ## Config highlights (exact fields)
 - `coin`: `ethernova`
 - `chainTypeOverride`: `Ethereum`
-- `blockConfirmations`: `16`
+- `blockConfirmations`: `16` (safe range 16-64; higher reduces orphan risk but delays payouts)
 - `paymentProcessing.minimumPayment`: `1.0` (default)
 - `pools[].address`: pool payout wallet
 
 ## E) Common pitfalls
 - Blocks stuck in NEW/Pending: RPC mismatch, payment processor disabled, or confirmations misconfigured.
-- No payouts: wallet locked, RPC missing `eth_sendTransaction` or `personal` module.
+- No payouts: RPC must allow transaction submission depending on payout mode (sendRawTx, unlocked wallet, or external signer). The `personal` module is only required for unlocked-account mode.
 - Workers show as `default`: miner never submitted a share yet, or the worker label is missing.
 
 ## F) Monitoring
