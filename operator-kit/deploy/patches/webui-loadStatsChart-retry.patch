@@ -1,0 +1,1719 @@
+From 59b62d9a9e3138dc1e83bcc4d6d06c7a863786c1 Mon Sep 17 00:00:00 2001
+From: root <root@vmi3027410.contaboserver.net>
+Date: Sat, 17 Jan 2026 04:38:46 +0100
+Subject: [PATCH] Improve stats chart API resilience
+
+---
+ miningcore.js | 1700 +++++++++++++++++++++++++++++++++++++++++++++++++
+ 1 file changed, 1700 insertions(+)
+ create mode 100644 miningcore.js
+
+diff --git a/miningcore.js b/miningcore.js
+new file mode 100644
+index 0000000..6deb360
+--- /dev/null
++++ b/miningcore.js
+@@ -0,0 +1,1700 @@
++/*!
++  * Miningcore.js v1.02
++  * Copyright 2020 Authors (https://github.com/minernl/Miningcore)
++  */
++
++// --------------------------------------------------------------------------------------------
++// --------------------------------------------------------------------------------------------
++// Ethernova branding / config
++// --------------------------------------------------------------------------------------------
++// --------------------------------------------------------------------------------------------
++
++
++
++
++
++
++
++
++
++
++
++
++var BRAND = {
++  poolTitle: "Ethernova Mining Pool",
++  coinName: "Ethernova",
++  coinSymbol: "NOVA",
++  stratumHost: "pool.ethnova.net",
++  stratumPort: 4073,
++};
++
++// API is reverse proxied by nginx at /api/
++var API = "/api/";
++var defaultPool = "nova1";
++var stratumAddress = BRAND.stratumHost;
++var currentNetworkDifficulty = null;
++var currentPoolHashrate = null;
++var lastMinerHashrate = null;
++var MINER_POLL_MS = 60000;
++var MINER_ACTIVE_WINDOW_SEC = 60;
++var minersPollHandle = null;
++var minersAbortController = null;
++var minersRequestId = 0;
++var STATS_CHART_TIMEOUT_MS = 12000;
++var STATS_CHART_RETRY_DELAYS_MS = [500, 1000, 2000];
++var statsChartRequestId = 0;
++var statsChartXhr = null;
++var statsChartLastData = null;
++var statsChartNotifyTs = 0;
++
++function stratumUrl(port) {
++  return "stratum+tcp://" + BRAND.stratumHost + ":" + port;
++}
++
++function getFirstPortFromPool(pool) {
++  if (!pool || !pool.ports || typeof pool.ports !== "object") return null;
++  var keys = Object.keys(pool.ports);
++  if (keys.length < 1) return null;
++  return String(keys[0]);
++}
++
++function updateHomeStratum(pools) {
++  var poolPort = null;
++  var soloPort = null;
++
++  if (pools && pools.length) {
++    var defaultPoolObj = null;
++    var poolCandidate = null;
++
++    for (var i = 0; i < pools.length; i++) {
++      var pool = pools[i];
++      if (!pool) continue;
++      if (pool.id === defaultPool) defaultPoolObj = pool;
++
++      var pp = pool.paymentProcessing || {};
++      var scheme = pp.payoutScheme ? String(pp.payoutScheme).toUpperCase() : "";
++
++      if (!soloPort && scheme === "SOLO") {
++        soloPort = getFirstPortFromPool(pool);
++      }
++
++      if (!poolCandidate && scheme && scheme !== "SOLO") {
++        poolCandidate = pool;
++      }
++    }
++
++    if (defaultPoolObj) poolPort = getFirstPortFromPool(defaultPoolObj);
++    if (!poolPort && poolCandidate) poolPort = getFirstPortFromPool(poolCandidate);
++  }
++
++  if (!poolPort && BRAND.stratumPort) poolPort = String(BRAND.stratumPort);
++
++  var poolEl = document.getElementById("stratum-pool-url");
++  if (poolEl) poolEl.textContent = poolPort ? stratumUrl(poolPort) : "n/a";
++
++  var soloEl = document.getElementById("stratum-solo-url");
++  if (soloEl) soloEl.textContent = soloPort ? stratumUrl(soloPort) : "n/a";
++}
++
++function getPoolModeLabel(pool) {
++  var scheme = "";
++  if (pool && pool.paymentProcessing && pool.paymentProcessing.payoutScheme) {
++    scheme = String(pool.paymentProcessing.payoutScheme).toUpperCase();
++  }
++  if (scheme === "SOLO") return "SOLO";
++  return "POOL";
++}
++
++
++
++
++
++
++
++
++// --------------------------------------------------------------------------------------------
++// no need to change anything below here
++// --------------------------------------------------------------------------------------------
++console.log(BRAND.poolTitle);
++console.log("API address used :", API);
++console.log("Stratum address  :", stratumUrl(BRAND.stratumPort));
++console.log('Page Load        : ', window.location.href);                     // Returns full URL
++
++currentPage = "index"
++
++// check browser compatibility
++var nua = navigator.userAgent;
++//var is_android = ((nua.indexOf('Mozilla/5.0') > -1 && nua.indexOf('Android ') > -1 && nua.indexOf('AppleWebKit') > -1) && !(nua.indexOf('Chrome') > -1));
++var is_IE = ((nua.indexOf('Mozilla/5.0') > -1 && nua.indexOf('Trident') > -1) && !(nua.indexOf('Chrome') > -1));
++if(is_IE) {
++	console.log('Running in IE browser is not supported - ', nua);
++}
++
++var __uiErrorShown = false;
++
++// Fill the copyright year spans once after DOM is ready.
++var __staticUiInitialized = false;
++
++function initStaticUi() {
++  if (__staticUiInitialized) return;
++  __staticUiInitialized = true;
++
++  try {
++    var year = String(new Date().getFullYear());
++    var els = document.querySelectorAll(".copyright-year");
++    for (var i = 0; i < els.length; i++) {
++      els[i].textContent = year;
++    }
++  } catch (e) {}
++}
++
++try {
++  if (document.readyState === "loading") {
++    document.addEventListener("DOMContentLoaded", initStaticUi);
++  } else {
++    initStaticUi();
++  }
++} catch (e) {}
++
++function escapeHtml(text) {
++  return String(text)
++    .replace(/&/g, "&amp;")
++    .replace(/</g, "&lt;")
++    .replace(/>/g, "&gt;")
++    .replace(/"/g, "&quot;")
++    .replace(/'/g, "&#039;");
++}
++
++function getHashQueryParams() {
++  try {
++    var rawHash = window.location.hash || "";
++    var qIndex = rawHash.indexOf("?");
++    if (qIndex < 0) return new URLSearchParams();
++    return new URLSearchParams(rawHash.slice(qIndex + 1));
++  } catch (e) {
++    return new URLSearchParams();
++  }
++}
++
++function normalizeHashValue(rawHash) {
++  if (!rawHash || rawHash === "#") return "";
++  if (rawHash.startsWith("#/")) return rawHash;
++  if (rawHash.startsWith("#")) return "#/" + rawHash.slice(1);
++  return "#/" + rawHash;
++}
++
++function parseHashRoute() {
++  var rawHash = window.location.hash || "";
++  if (!rawHash || rawHash === "#") return { pool: "", page: "" };
++
++  // Supports both legacy "#pool/page" and normalized "#/pool/page"
++  var hash = rawHash.replace(/^#\/?/, "");
++  if (!hash) return { pool: "", page: "" };
++
++  var qIndex = hash.indexOf("?");
++  var path = qIndex >= 0 ? hash.slice(0, qIndex) : hash;
++  var segments = path.split("/").filter(Boolean);
++
++  var pool = segments[0] || "";
++  var page = segments[1] || "";
++  if (page.toLowerCase() === "wallet") page = "dashboard";
++
++  return { pool: pool, page: page };
++}
++
++function parsePathRoute() {
++  var pathName = (window.location.pathname || "/").toLowerCase();
++  if (!pathName || pathName === "/") return { pool: "", page: "" };
++  if (pathName.match(/\\.[a-z0-9]+$/)) return { pool: "", page: "" };
++
++  var parts = pathName.split("/").filter(Boolean);
++  var pageMap = {
++    "connect": "connect",
++    "stats": "stats",
++    "wallet": "dashboard",
++    "dashboard": "dashboard",
++    "miners": "miners",
++    "blocks": "blocks",
++    "payments": "payments",
++    "faq": "faq",
++    "support": "support"
++  };
++
++  if (parts.length === 1) {
++    return { pool: defaultPool, page: pageMap[parts[0]] || "index" };
++  }
++  return { pool: parts[0], page: pageMap[parts[1]] || parts[1] };
++}
++
++function getCurrentRoute() {
++  var rawHash = window.location.hash || "";
++  if (rawHash) return parseHashRoute();
++  return parsePathRoute();
++}
++
++function renderConnectViewError(context, error) {
++  var details = "";
++  try {
++    if (error) details = error.stack || error.message || String(error);
++  } catch (e) {}
++
++  var html =
++    "<div class='alert alert-danger' style='margin:0'>" +
++    "<h4><i class='fas fa-exclamation-triangle'></i> Connect view failed</h4>" +
++    "<p style='margin:0 0 8px'>" +
++    escapeHtml(context || "Unknown error") +
++    "</p>" +
++    (details ? "<pre style='margin:0;white-space:pre-wrap;max-height:30vh;overflow:auto'>" + escapeHtml(details) + "</pre>" : "") +
++    "</div>";
++
++  try {
++    $("#connectPoolConfig").html("<tr><td colspan='2'>" + html + "</td></tr>");
++  } catch (e) {}
++  try {
++    $("#miner-config").html(html);
++  } catch (e) {}
++}
++
++function showUiErrorBanner(context, error) {
++  try {
++    console.error(context, error);
++  } catch (e) {}
++
++  try {
++    var details = "";
++    if (error) details = error.stack || error.message || String(error);
++
++    var banner = document.getElementById("ui-fatal-error");
++    if (!banner) {
++      banner = document.createElement("div");
++      banner.id = "ui-fatal-error";
++      banner.style.cssText = "position:fixed;left:0;right:0;top:0;z-index:99999;background:#2b0f1b;color:#fff;border-bottom:1px solid rgba(255,255,255,.14);padding:10px 12px;font:14px/1.35 system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial";
++      document.body.appendChild(banner);
++    }
++
++    banner.innerHTML =
++      "<strong>WebUI error:</strong> " +
++      escapeHtml(context) +
++      (details ? "<div style='margin-top:6px;opacity:.9;white-space:pre-wrap;max-height:45vh;overflow:auto'>" + escapeHtml(details) + "</div>" : "") +
++      "<div style='margin-top:8px;opacity:.85'>Refresh the page. If it persists, check nginx access/error logs.</div>";
++  } catch (e) {}
++
++  try {
++    // Prevent 'blank with footer' by forcing something visible
++    var route = getCurrentRoute();
++    var pageToShow = route.page || (route.pool ? "stats" : "index");
++
++    var mainIndex = document.querySelector(".main-index");
++    var mainPool = document.querySelector(".main-pool");
++    if (mainIndex) mainIndex.style.display = "";
++    if (mainPool) mainPool.style.display = "";
++
++    var pages = document.querySelectorAll(".page");
++    for (var i = 0; i < pages.length; i++) pages[i].style.display = "none";
++
++    var pageEl = document.querySelector(".page-" + pageToShow) || document.querySelector(".page-index");
++    if (pageEl) pageEl.style.display = "";
++  } catch (e) {}
++}
++
++window.addEventListener("error", function(evt) {
++  if (__uiErrorShown) return;
++  __uiErrorShown = true;
++  showUiErrorBanner("Unhandled JS error", evt && (evt.error || evt.message || evt));
++});
++
++window.addEventListener("unhandledrejection", function(evt) {
++  if (__uiErrorShown) return;
++  __uiErrorShown = true;
++  showUiErrorBanner("Unhandled promise rejection", evt && (evt.reason || evt));
++});
++
++// Load INDEX Page content
++function loadIndex() {
++  try {
++    // Normalize legacy hashes like "#nova1/connect" to "#/nova1/connect"
++    var rawHash = window.location.hash || "";
++    var normalizedHash = normalizeHashValue(rawHash);
++    if (normalizedHash && normalizedHash !== rawHash) {
++      try {
++        if (window.history && window.history.replaceState) {
++          window.history.replaceState(null, document.title, normalizedHash);
++        } else {
++          window.location.hash = normalizedHash;
++          return;
++        }
++      } catch (e) {
++        window.location.hash = normalizedHash;
++        return;
++      }
++    }
++
++    $("div[class^='page-']").hide();
++    $(".page").hide();
++    //$(".page-header").show();
++    $(".page-wrapper").show();
++    $(".page-footer").show();
++
++    // Hash router + path deep-link support
++    var route = getCurrentRoute();
++    currentPool = route.pool;
++    currentPage = route.page;
++
++    if (currentPool && !currentPage) {
++      currentPage = "stats";
++    }
++    else if (!currentPool && !currentPage) {
++      currentPage = "index";
++    }
++
++    if (currentPool && currentPage) {
++      loadNavigation();
++      $(".main-index").hide();
++	  $(".main-pool").show();
++	  $(".page-" + currentPage).show();
++	  $(".main-sidebar").show();
++    } else {
++      $(".main-index").show();
++	  $(".main-pool").hide();
++	  $(".page-index").show();
++      $(".main-sidebar").hide();
++    }
++
++    if (currentPool) {
++	  $("li[class^='nav-']").removeClass("active");
++
++	  switch (currentPage) {
++        case "stats":
++	      console.log('Loading stats page content');
++	      $(".nav-stats").addClass("active");
++          loadStatsPage();
++          break;
++        case "dashboard":
++	      console.log('Loading dashboard page content');
++          $(".nav-dashboard").addClass("active");
++		  loadDashboardPage();
++          break;
++	    case "miners":
++	      console.log('Loading miners page content');
++          $(".nav-miners").addClass("active");
++		  loadMinersPage();
++          break;
++        case "blocks":
++	      console.log('Loading blocks page content');
++	      $(".nav-blocks").addClass("active");
++          loadBlocksPage();
++          break;
++        case "payments":
++	      console.log('Loading payments page content');
++	      $(".nav-payments").addClass("active");
++          loadPaymentsPage();
++          break;
++        case "connect":
++	      console.log('Loading connect page content');
++          $(".nav-connect").addClass("active");
++		  loadConnectPage();
++          break;
++	    case "faq":
++	      console.log('Loading faq page content');
++          $(".nav-faq").addClass("active");
++          break;
++        case "support":
++	      console.log('Loading support page content');
++          $(".nav-support").addClass("active");
++          break;
++        default:
++        // default if nothing above fits
++      }
++    } else {
++      loadHomePage();
++    }
++
++    scrollPageTop();
++  } catch (err) {
++    showUiErrorBanner("UI render failed", err);
++  }
++}
++
++
++// Load HOME page content
++function loadHomePage() {
++  console.log('Loading home page content');
++  return $.ajax(API + "pools")
++    .done(function(data) {
++      const poolCoinCardTemplate = $(".index-coin-card-template").html();
++	  //const poolCoinTableTemplate = "";  //$(".index-coin-table-template").html();
++	  
++	  var poolCoinTableTemplate = "";
++		
++      $.each(data.pools, function(index, value) {
++ 
++        var coinLogo = "<img class='coinimg' src='/assets/brand/favicon.svg' alt='" + BRAND.coinSymbol + "' />";
++		var coinName = BRAND.coinName;
++		var coinSymbol = BRAND.coinSymbol;
++        var modeLabel = getPoolModeLabel(value);
++        var coinLabel = coinName + " (" + coinSymbol + ") - " + modeLabel;
++	        		
++		poolCoinTableTemplate += "<tr class='coin-table-row' href='#/" + value.id + "'>";
++		poolCoinTableTemplate += "<td class='coin'><a href='#/" + value.id + "'><span>" + coinLogo + coinLabel + " </span></a></td>";
++		poolCoinTableTemplate += "<td class='algo'>" + value.coin.algorithm + "</td>";
++		poolCoinTableTemplate += "<td class='miners'>" + value.poolStats.connectedMiners + "</td>";
++		poolCoinTableTemplate += "<td class='pool-hash'>" + _formatter(value.poolStats.poolHashrate, 5, "H/s") + "</td>";
++		poolCoinTableTemplate += "<td class='fee'>" + value.poolFeePercent + " %</td>";
++		poolCoinTableTemplate += "<td class='net-hash'>" + _formatter(value.networkStats.networkHashrate, 5, "H/s") + "</td>";
++		poolCoinTableTemplate += "<td class='net-diff'>" + _formatter(value.networkStats.networkDifficulty, 5, "") + "</td>";
++		poolCoinTableTemplate += "<td class='card-btn col-hide'>Go Mine " + coinLogo + coinSymbol + "</td>";
++		poolCoinTableTemplate += "</tr>";
++      });
++
++      //if (poolList.length > 0) {
++       	$(".pool-coin-table").html(poolCoinTableTemplate);
++      //}
++
++      updateHomeStratum(data.pools || []);
++	  	  
++	  $(document).ready(function() {
++        $('#pool-coins tr').click(function() {
++          var href = $(this).find("a").attr("href");
++          if(href) {
++            window.location = href;
++          }
++        });
++      });
++	  
++    })
++    .fail(function() {
++      var poolCoinTableTemplate = "";
++	  
++	  poolCoinTableTemplate += "<tr><td colspan='8'> ";
++	  poolCoinTableTemplate += "<div class='alert alert-warning'>"
++		poolCoinTableTemplate += "	<h4><i class='fas fa-exclamation-triangle'></i> Warning!</h4>";
++		poolCoinTableTemplate += "	<hr>";
++		poolCoinTableTemplate += "	<p>The pool is currently down for maintenance.</p>";
++		poolCoinTableTemplate += "	<p>Please try again later.</p>";
++	  poolCoinTableTemplate += "</div>"
++	  poolCoinTableTemplate += "</td></tr>";
++	  
++	  $(".pool-coin-table").html(poolCoinTableTemplate);
++	  
++    });
++}
++
++
++// Load STATS page content
++function loadStatsPage() {
++  //clearInterval();
++  setInterval(
++    (function load() {
++      loadStatsData();
++      return load;
++    })(),
++    60000
++  );
++  setInterval(
++    (function load() {
++      loadStatsChart();
++      return load;
++    })(),
++    60000
++  );
++}
++
++
++// Load DASHBOARD page content
++function loadDashboardPage() {
++  function render() {
++    //clearInterval();
++    setInterval(
++      (function load() {
++        loadDashboardData($("#walletAddress").val());
++        loadDashboardWorkerList($("#walletAddress").val());
++        loadDashboardChart($("#walletAddress").val());
++        return load;
++      })(),
++      60000
++    );
++  }
++  var wallet = getHashQueryParams().get("address");
++  if (wallet) {
++    $("#walletAddress").val(wallet);
++    localStorage.setItem(currentPool + "-walletAddress", wallet);
++    render();
++  }
++  if (localStorage[currentPool + "-walletAddress"]) {
++    $("#walletAddress").val(localStorage[currentPool + "-walletAddress"]);
++  }
++}
++
++function startMinersPolling() {
++  if (minersPollHandle) return;
++  minersPollHandle = setInterval(function() {
++    if (currentPage !== "miners") return;
++    refreshMinersData();
++  }, MINER_POLL_MS);
++}
++
++function refreshMinersData() {
++  var $minerList = $("#minerList");
++  if ($minerList.length) $minerList.addClass("is-refreshing");
++
++  if (minersAbortController && typeof minersAbortController.abort === "function") {
++    minersAbortController.abort();
++  }
++  minersAbortController = new AbortController();
++
++  var requestId = ++minersRequestId;
++  return fetch(
++    API + "pools/" + currentPool + "/bestminers?limit=20&activeWindow=" + MINER_ACTIVE_WINDOW_SEC,
++    {
++      signal: minersAbortController.signal,
++      cache: "no-store"
++    }
++  )
++    .then(function(response) {
++      if (!response.ok) throw new Error("Miners request failed");
++      return response.json();
++    })
++    .then(function(data) {
++      if (requestId !== minersRequestId) return;
++      var miners = Array.isArray(data) ? data : ((data && (data.miners || data.result)) || []);
++      renderBestMinersTable(miners);
++    })
++    .catch(function(err) {
++      if (err && err.name === "AbortError") return;
++      $.notify(
++        {
++          message: "Error: No response from API.<br>(loadMinersList)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    })
++    .finally(function() {
++      if (requestId === minersRequestId) {
++        if ($minerList.length) $minerList.removeClass("is-refreshing");
++      }
++    });
++}
++
++function renderBestMinersTable(miners) {
++  var minerList = "";
++  var list = Array.isArray(miners) ? miners : [];
++
++  function formatRate(value, unit) {
++    var num = parseNumber(value);
++    if (num === null || num <= 0) return "—";
++    return _formatter(num, 5, unit);
++  }
++
++  if (list.length > 0) {
++    for (var i = 0; i < list.length; i++) {
++      var value = list[i] || {};
++      var address = value.miner || value.address || value.wallet || "";
++      var addressText = address ? escapeHtml(address) : "—";
++      var addressHref = address
++        ? "<a href='#/" + currentPool + "/dashboard?address=" + encodeURIComponent(address) + "'>" + addressText + "</a>"
++        : "—";
++
++      var hashrateText = formatRate(value.hashrate, "H/s");
++      var shareRateText = formatRate(value.sharesPerSecond, "S/s");
++
++      minerList += "<tr>";
++      minerList += "<td>" + addressHref + "</td>";
++      minerList += "<td>" + hashrateText + "</td>";
++      minerList += "<td>" + shareRateText + "</td>";
++      minerList += "</tr>";
++    }
++  } else {
++    minerList += '<tr><td colspan="3">No active miners right now</td></tr>';
++  }
++
++  $("#minerList").html(minerList);
++}
++
++// Load MINERS page content
++function loadMinersPage() {
++  startMinersPolling();
++  return refreshMinersData();
++}
++
++
++// Load BLOCKS page content
++function loadBlocksPage() {
++  return $.ajax(API + "pools/" + currentPool + "/blocks?page=0&pageSize=100")
++    .done(function(data) {
++      var blockList = "";
++      var blocks = Array.isArray(data) ? data : (data.blocks || data.result || []);
++
++	      function formatCompactNumber(value, decimals) {
++	        if (typeof value === "undefined" || value === null) return "—";
++	        var num = Number(value);
++	        if (!isFinite(num)) return "—";
++	        if (num === 0) return "0";
++	        var abs = Math.abs(num);
++	        var units = [
++	          { v: 1e24, s: "Y" },
++	          { v: 1e21, s: "Z" },
++	          { v: 1e18, s: "E" },
++          { v: 1e15, s: "P" },
++          { v: 1e12, s: "T" },
++          { v: 1e9, s: "G" },
++          { v: 1e6, s: "M" },
++          { v: 1e3, s: "k" },
++          { v: 1, s: "" },
++	        ];
++	        for (var i = 0; i < units.length; i++) {
++	          if (abs >= units[i].v) {
++	            return (num / units[i].v).toFixed(decimals) + units[i].s;
++	          }
++	        }
++	        return num.toFixed(decimals);
++	      }
++
++	      function parseEffort(value) {
++	        if (typeof value === "undefined" || value === null) return null;
++	        var isPercent = false;
++	        if (typeof value === "string") {
++	          var s = value.trim();
++	          if (!s) return null;
++	          if (s.slice(-1) === "%") {
++	            isPercent = true;
++	            s = s.slice(0, -1).trim();
++	          }
++	          if (s.indexOf(",") !== -1 && s.indexOf(".") === -1) {
++	            s = s.replace(",", ".");
++	          }
++	          value = s;
++	        }
++	        var num = Number(value);
++	        if (!isFinite(num)) return null;
++	        return { num: num, isPercent: isPercent };
++	      }
++
++	      function getEffortInput(block) {
++	        if (!block) return null;
++	        if (typeof block.effortPercent !== "undefined" && block.effortPercent !== null) {
++	          return { value: block.effortPercent, isPercent: true };
++	        }
++	        if (typeof block.effortPct !== "undefined" && block.effortPct !== null) {
++	          return { value: block.effortPct, isPercent: true };
++	        }
++	        if (typeof block.effort !== "undefined" && block.effort !== null) {
++	          return { value: block.effort, isPercent: false };
++	        }
++	        return null;
++	      }
++
++	      function formatEffortDisplay(block) {
++	        var input = getEffortInput(block);
++	        var parsed = input ? parseEffort(input.value) : null;
++	        if (parsed && input && input.isPercent) parsed.isPercent = true;
++
++	        var conf = parseNumber(block && block.confirmationProgress);
++	        var hasProgress = conf !== null && conf > 0;
++
++	        if (!parsed || parsed.num === null) {
++	          return { text: hasProgress ? "calculating..." : "—", className: "effort-muted" };
++	        }
++
++	        var effortPct = parsed.isPercent ? parsed.num : (parsed.num * 100);
++	        if (!isFinite(effortPct) || effortPct <= 0) {
++	          return { text: hasProgress ? "calculating..." : "—", className: "effort-muted" };
++	        }
++
++	        var effortText = effortPct < 0.01 ? "&lt;0.01%" : effortPct.toFixed(2) + "%";
++	        var effortClass = "";
++	        if (effortPct < 30) {
++	          effortClass = "effort1";
++	        } else if (effortPct < 80) {
++	          effortClass = "effort2";
++	        } else if (effortPct < 110) {
++	          effortClass = "effort3";
++	        } else {
++	          effortClass = "effort4";
++	        }
++	        return { text: effortText, className: effortClass };
++	      }
++
++      function shortHex(value) {
++        if (typeof value === "undefined" || value === null) return "—";
++        value = String(value);
++        if (value.length <= 12) return value;
++        return value.substring(0, 6) + "…" + value.substring(value.length - 4);
++      }
++
++      function copyText(text) {
++        try {
++          if (navigator.clipboard && navigator.clipboard.writeText) {
++            navigator.clipboard.writeText(text);
++            return;
++          }
++        } catch (e) {
++          // ignore
++        }
++        var $tmp = $("<input>");
++        $("body").append($tmp);
++        $tmp.val(text).select();
++        document.execCommand("copy");
++        $tmp.remove();
++      }
++
++      $(document)
++        .off("click", ".copy-link")
++        .on("click", ".copy-link", function(e) {
++          e.preventDefault();
++          var text = $(this).attr("data-copy");
++          if (!text) return;
++          copyText(text);
++          if (typeof $.notify === "function") {
++            $.notify({ message: "Copied" }, { type: "success", timer: 1200 });
++          }
++        });
++
++      if (blocks.length > 0) {
++        $.each(blocks, function(index, value) {
++		  var createDate = convertLocalDateToUTCDate(new Date(value.created),false);
++	          var effortDisplay = formatEffortDisplay(value);
++	          var effortClass = effortDisplay.className || "";
++	          var effortText = effortDisplay.text;
++
++          var diffFull = (typeof value.blockDifficulty !== "undefined" && value.blockDifficulty !== null) ? value.blockDifficulty : null;
++          var diffText = formatCompactNumber(diffFull, 2);
++
++          var blockTimeText = "—";
++          if (typeof value.blockTimeSeconds !== "undefined" && value.blockTimeSeconds !== null && isFinite(value.blockTimeSeconds)) {
++            blockTimeText = value.blockTimeSeconds.toFixed(1).replace(/\\.0$/, "") + "s";
++          }
++
++          var txCountText = "—";
++          if (typeof value.txCount !== "undefined" && value.txCount !== null) {
++            txCountText = value.txCount;
++          }
++
++          var minerFull = (typeof value.blockMiner !== "undefined" && value.blockMiner !== null) ? value.blockMiner : null;
++          var minerCell = "—";
++          if (minerFull) {
++            minerCell =
++              "<span title='" +
++              minerFull +
++              "'>" +
++              shortHex(minerFull) +
++              "</span> <a href='#' class='copy-link' data-copy='" +
++              minerFull +
++              "'>copy</a>";
++          }
++
++          var gasUsedFull = (typeof value.gasUsed !== "undefined" && value.gasUsed !== null) ? value.gasUsed : null;
++          var gasUsedText = formatCompactNumber(gasUsedFull, 2);
++
++          var baseFeeFull = (typeof value.baseFeePerGas !== "undefined" && value.baseFeePerGas !== null) ? value.baseFeePerGas : null;
++          var baseFeeText = "—";
++          var baseFeeTitle = "";
++          if (baseFeeFull !== null && isFinite(baseFeeFull)) {
++            var baseFeeGwei = baseFeeFull / 1e9;
++            if (isFinite(baseFeeGwei)) {
++              if (baseFeeGwei > 0 && baseFeeGwei < 0.01) {
++                baseFeeText = "&lt;0.01 gwei";
++              } else {
++                baseFeeText = formatCompactNumber(baseFeeGwei, 2) + " gwei";
++              }
++            } else {
++              baseFeeText = "—";
++            }
++            baseFeeTitle = baseFeeFull + " wei";
++          }
++
++          var sizeBytesFull = (typeof value.blockSizeBytes !== "undefined" && value.blockSizeBytes !== null) ? value.blockSizeBytes : null;
++          var sizeText = "—";
++          var sizeTitle = "";
++          if (sizeBytesFull !== null && isFinite(sizeBytesFull)) {
++            var sizeKb = sizeBytesFull / 1024;
++            sizeText = isFinite(sizeKb) ? sizeKb.toFixed(1).replace(/\\.0$/, "") + " KB" : "—";
++            sizeTitle = sizeBytesFull + " bytes";
++          }
++
++          blockList += "<tr>";
++          blockList += "<td>" + createDate + "</td>";
++          if (value.infoLink && value.infoLink.length > 0) {
++            blockList += "<td><a href='" + value.infoLink + "' target='_blank'>" + value.blockHeight + "</a></td>";
++          } else {
++            blockList += "<td>" + value.blockHeight + "</td>";
++          }
++          blockList += "<td>" + minerCell + "</td>";
++          blockList += "<td class='" + effortClass + "'>" + effortText + "</td>";
++          blockList += "<td title='" + (diffFull !== null ? diffFull : "") + "'>" + diffText + "</td>";
++          blockList += "<td>" + blockTimeText + "</td>";
++          blockList += "<td>" + txCountText + "</td>";
++          blockList += "<td title='" + (gasUsedFull !== null ? gasUsedFull : "") + "'>" + gasUsedText + "</td>";
++          blockList += "<td title='" + baseFeeTitle + "'>" + baseFeeText + "</td>";
++          blockList += "<td title='" + sizeTitle + "'>" + sizeText + "</td>";
++          var status = value.status || "";
++          var statusLower = String(status).toLowerCase();
++
++	          var rewardValue = null;
++	          if (typeof value.reward !== "undefined" && value.reward !== null && isFinite(value.reward)) {
++	            rewardValue = value.reward;
++	          }
++
++	          var rewardText = rewardValue === null ? "—" : _formatter(rewardValue, 4, " " + BRAND.coinSymbol);
++	          if (statusLower === "pending" && rewardValue === null) {
++	            rewardText = "N/A (pending)";
++	          }
++
++	          var confCell = "—";
++	          if (typeof value.confirmationProgress !== "undefined" && value.confirmationProgress !== null && isFinite(value.confirmationProgress)) {
++	            var confPctRaw = value.confirmationProgress * 100;
++	            var confPct = Math.round(confPctRaw);
++	            if (!isFinite(confPct)) confPct = 0;
++	            if (confPct < 0) confPct = 0;
++	            if (confPct > 100) confPct = 100;
++	            confCell = "<span class='badge badge-confirm'>" + confPct + "%</span>";
++	          }
++
++          blockList += "<td>" + status + "</td>";
++          blockList += "<td>" + rewardText + "</td>";
++          blockList += "<td>" + confCell + "</td>";
++          blockList += "</tr>";
++        });
++      } else {
++        blockList += '<tr><td colspan="13">No blocks found yet</td></tr>';
++      }
++
++      $("#blockList").html(blockList);
++    })
++	    .fail(function(jqXHR, textStatus, errorThrown) {
++	      try {
++	        var msg = "API unavailable.";
++	        if (textStatus) msg += " (" + textStatus + ")";
++	        $("#blockList").html("<tr><td colspan=\"13\"><div class=\"alert alert-danger\"><h4><i class=\"fas fa-exclamation-triangle\"></i> Blocks failed to load</h4><p style=\"margin:0\">" + msg + "</p></div></td></tr>");
++	      } catch (e) {}
++	      $.notify(
++	        {
++	          message: "Error: No response from API.<br>(loadBlocksList)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    });
++}
++
++// Load PAYMENTS page content
++function loadPaymentsPage() {
++  return $.ajax(API + "pools/" + currentPool + "/payments?page=0&pageSize=500")
++    .done(function(data) {
++      var paymentList = "";
++      if (data.length > 0) {
++        $.each(data, function(index, value) {
++          var createDate = convertLocalDateToUTCDate(new Date(value.created),false);
++          paymentList += '<tr>';
++          paymentList +=   "<td>" + createDate + "</td>";
++          paymentList +=   '<td><a href="' + value.addressInfoLink + '" target="_blank">' + value.address.substring(0, 12) + ' &hellip; ' + value.address.substring(value.address.length - 12) + '</td>';
++          paymentList +=   '<td>' + _formatter(value.amount, 5, ' ' + BRAND.coinSymbol) + '</td>';
++          paymentList +=   '<td colspan="2"><a href="' + value.transactionInfoLink + '" target="_blank">' + value.transactionConfirmationData.substring(0, 16) + ' &hellip; ' + value.transactionConfirmationData.substring(value.transactionConfirmationData.length - 16) + ' </a></td>';
++          paymentList += '</tr>';
++        });
++      } else {
++        paymentList += '<tr><td colspan="4">No payments found yet</td></tr>';
++      }
++      $("#paymentList").html(paymentList);
++    })
++    .fail(function() {
++      $.notify(
++        {
++          message: "Error: No response from API.<br>(loadPaymentsList)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    });
++}
++
++// Load CONNECTION page content
++function loadConnectPage() {
++  return $.ajax(API + "pools")
++    .done(function(data) {
++      try {
++        var connectPoolConfig = "";
++        var coinName = BRAND.coinName;
++        var coinType = String(BRAND.coinSymbol || "nova").toLowerCase();
++        var algorithm = "—";
++        var defaultPort = String(BRAND.stratumPort || 4073);
++        var foundPool = false;
++
++        var pools = (data && data.pools) ? data.pools : [];
++        $.each(pools, function(index, value) {
++          if (!value) return;
++          if (currentPool !== value.id) return;
++          foundPool = true;
++
++          var ports = (value.ports && typeof value.ports === "object") ? value.ports : {};
++          var portKeys = Object.keys(ports);
++          if (portKeys.length > 0) defaultPort = String(portKeys[0]);
++
++          var coin = value.coin || {};
++          algorithm = coin.algorithm ? coin.algorithm : algorithm;
++
++          var pp = value.paymentProcessing || {};
++          var payoutScheme = pp.payoutScheme ? pp.payoutScheme : "—";
++          var minimumPayment = (typeof pp.minimumPayment !== "undefined" && pp.minimumPayment !== null) ? (pp.minimumPayment + " " + BRAND.coinSymbol) : "—";
++          var minimumPaymentToExchange = (typeof pp.minimumPaymentToPaymentId !== "undefined" && pp.minimumPaymentToPaymentId !== null) ? pp.minimumPaymentToPaymentId : null;
++          var poolFee = (typeof value.poolFeePercent !== "undefined" && value.poolFeePercent !== null) ? (value.poolFeePercent + "%") : "—";
++
++          var wallet = value.address ? String(value.address) : "";
++          var walletShort = wallet ? (wallet.substring(0, 12) + " &hellip; " + wallet.substring(wallet.length - 12)) : "—";
++          var walletCell = walletShort;
++          if (wallet && value.addressInfoLink) {
++            walletCell = "<a href='" + value.addressInfoLink + "' target='_blank'>" + walletShort + "</a>";
++          }
++
++          // Connect Pool config table
++          connectPoolConfig += "<tr><td>STRATUM</td><td><code>" + stratumUrl(defaultPort) + "</code></td></tr>";
++          connectPoolConfig += "<tr><td>USER</td><td><code>0xWALLET.Worker01</code></td></tr>";
++          connectPoolConfig += "<tr><td>PASS</td><td><code>x</code></td></tr>";
++          connectPoolConfig += "<tr><td>Coin</td><td>" + coinName + " (" + BRAND.coinSymbol + ") </td></tr>";
++          connectPoolConfig += "<tr><td>Coin Algorithm</td><td>" + algorithm + "</td></tr>";
++          connectPoolConfig += "<tr><td>Pool Wallet</td><td>" + walletCell + "</td></tr>";
++          connectPoolConfig += "<tr><td>Payout Scheme</td><td>" + payoutScheme + "</td></tr>";
++          connectPoolConfig += "<tr><td>Minimum Payment</td><td>" + minimumPayment + "</td></tr>";
++          if (minimumPaymentToExchange !== null) {
++            connectPoolConfig += "<tr><td>Minimum Payout (to Exchange)</td><td>" + minimumPaymentToExchange + "</td></tr>";
++          }
++          connectPoolConfig += "<tr><td>Pool Fee</td><td>" + poolFee + "</td></tr>";
++
++          $.each(ports, function(port, options) {
++            options = options || {};
++            connectPoolConfig += "<tr><td>" + stratumUrl(port) + "</td><td>";
++            if (typeof options.varDiff !== "undefined" && options.varDiff != null) {
++              var vd = options.varDiff || {};
++              connectPoolConfig += "Difficulty Variable / " + (vd.minDiff != null ? vd.minDiff : "—") + " &harr; ";
++              if (typeof vd.maxDiff === "undefined" || vd.maxDiff == null) {
++                connectPoolConfig += "&infin; ";
++              } else {
++                connectPoolConfig += vd.maxDiff;
++              }
++            } else if (typeof options.difficulty !== "undefined" && options.difficulty !== null) {
++              connectPoolConfig += "Difficulty Static / " + options.difficulty;
++            } else {
++              connectPoolConfig += "Difficulty —";
++            }
++            connectPoolConfig += "</td></tr>";
++          });
++        });
++
++        if (!foundPool) {
++          renderConnectViewError("Pool not found: " + currentPool, null);
++          return;
++        }
++
++        if (!connectPoolConfig) {
++          renderConnectViewError("Pool config is empty", null);
++          return;
++        }
++
++        $("#connectPoolConfig").html(connectPoolConfig);
++
++        // Connect Miner config
++        $("#miner-config").html("");
++        $("#miner-config").load("/poolconfig/" + coinType + ".html", function(response, status, xhr) {
++          try {
++            if (status == "error") {
++              $("#miner-config").load("/poolconfig/default.html", function(responseText) {
++                try {
++                  var config = $("#miner-config")
++                    .html()
++                    .replace(/{{ stratumAddress }}/g, stratumAddress + ":" + defaultPort)
++                    .replace(/{{ coinName }}/g, coinName)
++                    .replace(/{{ aglorithm }}/g, algorithm);
++                  $(this).html(config);
++                } catch (err) {
++                  renderConnectViewError("Miner configuration render failed", err);
++                }
++              });
++            } else {
++              var config = $("#miner-config")
++                .html()
++                .replace(/{{ stratumAddress }}/g, stratumAddress + ":" + defaultPort)
++                .replace(/{{ coinName }}/g, coinName)
++                .replace(/{{ aglorithm }}/g, algorithm);
++              $(this).html(config);
++            }
++          } catch (err) {
++            renderConnectViewError("Miner configuration render failed", err);
++          }
++        });
++      } catch (err) {
++        renderConnectViewError("Connect render failed", err);
++      }
++    })
++    .fail(function(jqXHR, textStatus, errorThrown) {
++      renderConnectViewError("API request failed: " + (textStatus || "unknown"), errorThrown || textStatus);
++      $.notify(
++        {
++          message: "Error: No response from API.<br>(loadConnectConfig)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    });
++}
++
++
++// Dashboard - load wallet stats
++function loadWallet() {
++  var walletAddressValue = $("#walletAddress").val();
++  console.log('Loading wallet address:', walletAddressValue);
++
++  if (walletAddressValue.length > 0) {
++    localStorage.setItem(currentPool + "-walletAddress", walletAddressValue);
++  }
++
++  var route = getCurrentRoute();
++  var pool = route.pool || currentPool || defaultPool;
++  var page = route.page || currentPage || "stats";
++  window.location.hash = "/" + pool + "/" + page + "?address=" + encodeURIComponent(walletAddressValue);
++  return false;
++}
++
++
++// General formatter function
++function _formatter(value, decimal, unit) {
++  if (value === 0) {
++    return "0 " + unit;
++  } else {
++    var si = [
++      { value: 1, symbol: "" },
++      { value: 1e3, symbol: "k" },
++      { value: 1e6, symbol: "M" },
++      { value: 1e9, symbol: "G" },
++      { value: 1e12, symbol: "T" },
++      { value: 1e15, symbol: "P" },
++      { value: 1e18, symbol: "E" },
++      { value: 1e21, symbol: "Z" },
++      { value: 1e24, symbol: "Y" }
++    ];
++    for (var i = si.length - 1; i > 0; i--) {
++      if (value >= si[i].value) {
++        break;
++      }
++    }
++    return ((value / si[i].value).toFixed(decimal).replace(/\.0+$|(\.[0-9]*[1-9])0+$/, "$1") + " " + si[i].symbol + unit);
++  }
++}
++
++function parseNumber(value) {
++  if (typeof value === "undefined" || value === null) return null;
++  var num = Number(value);
++  if (!isFinite(num)) return null;
++  return num;
++}
++
++function computeTtfSeconds(networkDifficulty, hashrate) {
++  var diff = parseNumber(networkDifficulty);
++  var rate = parseNumber(hashrate);
++  if (diff === null || rate === null || diff <= 0 || rate <= 0) return null;
++  var seconds = diff / rate;
++  if (!isFinite(seconds) || seconds <= 0) return null;
++  return seconds;
++}
++
++function formatDuration(seconds) {
++  var sec = parseNumber(seconds);
++  if (sec === null || sec <= 0) return "—";
++  sec = Math.round(sec);
++  if (sec < 60) return sec + "s";
++
++  var minute = 60;
++  var hour = 3600;
++  var day = 86400;
++  var year = 31536000;
++
++  if (sec < hour) {
++    var m = Math.floor(sec / minute);
++    var s = sec % minute;
++    return m + "m " + (s < 10 ? "0" : "") + s + "s";
++  }
++
++  if (sec < day) {
++    var h = Math.floor(sec / hour);
++    var m2 = Math.floor((sec % hour) / minute);
++    return h + "h " + (m2 < 10 ? "0" : "") + m2 + "m";
++  }
++
++  if (sec < year) {
++    var d = Math.floor(sec / day);
++    var h2 = Math.floor((sec % day) / hour);
++    return d + "d " + h2 + "h";
++  }
++
++  var y = Math.floor(sec / year);
++  var d2 = Math.floor((sec % year) / day);
++  return y + "y " + d2 + "d";
++}
++
++function computeChance(ttfSeconds, tSeconds) {
++  var ttf = parseNumber(ttfSeconds);
++  var t = parseNumber(tSeconds);
++  if (ttf === null || t === null || ttf <= 0 || t < 0) return null;
++  var ratio = t / ttf;
++  if (!isFinite(ratio) || ratio < 0) return null;
++  var chance = 1 - Math.exp(-ratio);
++  if (!isFinite(chance)) return null;
++  if (chance < 0) return 0;
++  if (chance > 1) return 1;
++  return chance;
++}
++
++function formatPercent(value) {
++  var val = parseNumber(value);
++  if (val === null) return "—";
++  var pct = val * 100;
++  if (!isFinite(pct)) return "—";
++  if (pct < 0) pct = 0;
++  if (pct > 100) pct = 100;
++  return Math.round(pct) + "%";
++}
++
++function formatCoinAmount(value) {
++  var num = parseNumber(value);
++  if (num === null) return "—";
++  var text = num.toFixed(6).replace(/\.0+$/, "").replace(/(\.[0-9]*[1-9])0+$/, "$1");
++  return text + " " + BRAND.coinSymbol;
++}
++
++function formatBlocksPerDay(ttfSeconds) {
++  var ttf = parseNumber(ttfSeconds);
++  if (ttf === null || ttf <= 0) return "—";
++  var blocks = 86400 / ttf;
++  if (!isFinite(blocks) || blocks < 0) return "—";
++  return blocks.toFixed(2) + " blocks/day";
++}
++
++function formatChanceWindow(ttfSeconds, windowSeconds) {
++  var chance = computeChance(ttfSeconds, windowSeconds);
++  return formatPercent(chance);
++}
++
++function extractBlockReward(blocks) {
++  if (!Array.isArray(blocks) || blocks.length < 1) return null;
++  var reward = blocks[0].reward;
++  if (typeof reward === "undefined" || reward === null) return null;
++  return reward;
++}
++
++function fetchLatestBlockReward(poolId, done) {
++  return $.ajax(API + "pools/" + poolId + "/blocks?page=0&pageSize=1")
++    .done(function(data) {
++      done(extractBlockReward(data));
++    })
++    .fail(function() {
++      done(null);
++    });
++}
++
++function fetchLatestBlockRewardWithFallback(poolId, fallbackPoolId, done) {
++  fetchLatestBlockReward(poolId, function(reward) {
++    if (reward !== null) {
++      done(reward);
++      return;
++    }
++    if (fallbackPoolId && fallbackPoolId !== poolId) {
++      fetchLatestBlockReward(fallbackPoolId, done);
++      return;
++    }
++    done(null);
++  });
++}
++
++function updateCoinsPerDay(poolTtf, blockReward) {
++  var ttf = parseNumber(poolTtf);
++  var reward = parseNumber(blockReward);
++
++  if (reward === null) {
++    $("#poolBlockReward").text("—");
++    $("#poolCoinsPerDay").text("—");
++    return;
++  }
++
++  $("#poolBlockReward").text(formatCoinAmount(reward));
++
++  if (ttf === null || ttf <= 0) {
++    $("#poolCoinsPerDay").text("—");
++    return;
++  }
++
++  var coinsPerDay = (86400 / ttf) * reward;
++  $("#poolCoinsPerDay").text(formatCoinAmount(coinsPerDay));
++}
++
++function updatePoolOddsWidget(poolStats, networkStats, poolTtf) {
++  var poolHashrate = parseNumber(poolStats && poolStats.poolHashrate);
++  var networkHashrate = parseNumber(networkStats && networkStats.networkHashrate);
++  var networkDifficulty = parseNumber(networkStats && networkStats.networkDifficulty);
++
++  $("#poolHashRateDetail").text(poolHashrate === null ? "—" : _formatter(poolHashrate, 5, "H/s"));
++  $("#networkHashRateDetail").text(networkHashrate === null ? "—" : _formatter(networkHashrate, 5, "H/s"));
++  $("#networkDifficultyDetail").text(networkDifficulty === null ? "—" : _formatter(networkDifficulty, 5, ""));
++  $("#poolTtfBlockDetail").text(formatDuration(poolTtf));
++  $("#poolBlocksPerDay").text(formatBlocksPerDay(poolTtf));
++
++  $("#poolChance10m").text(formatChanceWindow(poolTtf, 600));
++  $("#poolChance30m").text(formatChanceWindow(poolTtf, 1800));
++  $("#poolChance1h").text(formatChanceWindow(poolTtf, 3600));
++  $("#poolChance2h").text(formatChanceWindow(poolTtf, 7200));
++  $("#poolChance6h").text(formatChanceWindow(poolTtf, 21600));
++  $("#poolChance12h").text(formatChanceWindow(poolTtf, 43200));
++  $("#poolChance24h").text(formatChanceWindow(poolTtf, 86400));
++}
++
++function renderChanceLine(ttfSeconds) {
++  var ttf = parseNumber(ttfSeconds);
++  if (ttf === null || ttf <= 0) return "—";
++  var c1 = computeChance(ttf, 3600);
++  var c2 = computeChance(ttf, ttf);
++  var c3 = computeChance(ttf, ttf * 2);
++  if (c1 === null || c2 === null || c3 === null) return "—";
++  return "1h: " + formatPercent(c1) + " • TTF: " + formatPercent(c2) + " • 2×TTF: " + formatPercent(c3);
++}
++
++
++// Time convert Local -> UTC
++function convertLocalDateToUTCDate(date, toUTC) {
++  date = new Date(date);
++  //Local time converted to UTC
++  var localOffset = date.getTimezoneOffset() * 60000;
++  var localTime = date.getTime();
++  if (toUTC) {
++    date = localTime + localOffset;
++  } else {
++    date = localTime - localOffset;
++  }
++  newDate = new Date(date);
++  return newDate;
++}
++
++
++// Time convert UTC -> Local
++function convertUTCDateToLocalDate(date) {
++    var newDate = new Date(date.getTime()+date.getTimezoneOffset()*60*1000);
++    var localOffset = date.getTimezoneOffset() / 60;
++    var hours = date.getUTCHours();
++    newDate.setHours(hours - localOffset);
++    return newDate;
++}
++
++
++// Scroll to top off page
++function scrollPageTop() {
++  document.body.scrollTop = 0;
++  document.documentElement.scrollTop = 0;
++  var elmnt = document.getElementById("page-scroll-top");
++  elmnt.scrollIntoView();
++}
++
++
++// Check if file exits
++function doesFileExist(urlToFile) {
++    var xhr = new XMLHttpRequest();
++    xhr.open('HEAD', urlToFile, false);
++    xhr.send();
++     
++    if (xhr.status == "404") {
++        return false;
++    } else {
++        return true;
++    }
++}
++
++
++// STATS page data
++function loadStatsData() {
++  return $.ajax(API + "pools")
++    .done(function(data) {
++      $.each(data.pools, function(index, value) {
++        if (currentPool === value.id) {
++			
++		  $("#blockchainHeight").text(value.networkStats.blockHeight);
++		  $("#connectedPeers").text(value.networkStats.connectedPeers);
++		  $("#minimumPayment").text(value.paymentProcessing.minimumPayment + " " + BRAND.coinSymbol);
++		  $("#payoutScheme").text(value.paymentProcessing.payoutScheme);
++		  $("#poolFeePercent").text(value.poolFeePercent + " %");
++		  
++          $("#poolHashRate").text(_formatter(value.poolStats.poolHashrate, 5, "H/s"));
++		  $("#poolMiners").text(value.poolStats.connectedMiners + " Miner(s)");
++          
++          $("#networkHashRate").text(_formatter(value.networkStats.networkHashrate, 5, "H/s"));
++          $("#networkDifficulty").text(_formatter(value.networkStats.networkDifficulty, 5, ""));
++
++          currentNetworkDifficulty = parseNumber(value.networkStats.networkDifficulty);
++          currentPoolHashrate = parseNumber(value.poolStats.poolHashrate);
++          var poolTtf = computeTtfSeconds(currentNetworkDifficulty, currentPoolHashrate);
++          $("#poolTtfBlock").text(formatDuration(poolTtf));
++          $("#poolChanceBlock").text(renderChanceLine(poolTtf));
++          updatePoolOddsWidget(value.poolStats, value.networkStats, poolTtf);
++          fetchLatestBlockRewardWithFallback(currentPool, defaultPool, function(reward) {
++            updateCoinsPerDay(poolTtf, reward);
++          });
++
++          if (lastMinerHashrate !== null) {
++            var minerTtf = computeTtfSeconds(currentNetworkDifficulty, lastMinerHashrate);
++            $("#minerTtfBlock").text(formatDuration(minerTtf));
++            $("#minerChanceBlock").text(renderChanceLine(minerTtf));
++          }
++        }
++      });
++    })
++    .fail(function() {
++      $.notify(
++        {
++          message: "Error: No response from API.<br>(loadStatsData)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    });
++}
++
++
++// STATS page charts
++function notifyStatsChartUnavailable() {
++  var now = Date.now();
++  if (now - statsChartNotifyTs < 30000) return;
++  statsChartNotifyTs = now;
++  $.notify(
++    {
++      message: "API temporarily unavailable — retrying…"
++    },
++    {
++      type: "info",
++      timer: 4000
++    }
++  );
++}
++
++function renderStatsChart(data) {
++  var labels = [];
++  var poolHashRate = [];
++  var networkHashRate = [];
++  var networkDifficulty = [];
++  var connectedMiners = [];
++  var connectedWorkers = [];
++  var stats = (data && data.stats) ? data.stats : [];
++
++  $.each(stats, function(index, value) {
++    if (labels.length === 0 || (labels.length + 1) % 4 === 1) {
++      var createDate = convertLocalDateToUTCDate(new Date(value.created), false);
++      labels.push(createDate.getHours() + ":00");
++    } else {
++      labels.push("");
++    }
++    poolHashRate.push(value.poolHashrate);
++    networkHashRate.push(value.networkHashrate);
++    networkDifficulty.push(value.networkDifficulty);
++    connectedMiners.push(value.connectedMiners);
++    connectedWorkers.push(value.connectedWorkers);
++  });
++
++  var dataPoolHash          = {labels: labels,series: [poolHashRate]};
++  var dataNetworkHash       = {labels: labels,series: [networkHashRate]};
++  var dataNetworkDifficulty = {labels: labels,series: [networkDifficulty]};
++  var dataMiners            = {labels: labels,series: [connectedMiners,connectedWorkers]};
++
++  var options = {
++    height: "200px",
++    showArea: false,
++    seriesBarDistance: 1,
++    // low:Math.min.apply(null,networkHashRate)/1.1,
++    axisX: {
++      showGrid: false
++    },
++    axisY: {
++      offset: 47,
++      scale: "logcc",
++      labelInterpolationFnc: function(value) {
++        return _formatter(value, 1, "");
++      }
++    },
++    lineSmooth: Chartist.Interpolation.simple({
++      divisor: 2
++    })
++  };
++
++  var responsiveOptions = [
++    [
++      "screen and (max-width: 320px)",
++      {
++        axisX: {
++          labelInterpolationFnc: function(value) {
++            return value[1];
++          }
++        }
++      }
++    ]
++  ];
++  Chartist.Line("#chartStatsHashRate", dataNetworkHash, options, responsiveOptions);
++  Chartist.Line("#chartStatsHashRatePool",dataPoolHash,options,responsiveOptions);
++  Chartist.Line("#chartStatsDiff", dataNetworkDifficulty, options, responsiveOptions);
++  Chartist.Line("#chartStatsMiners", dataMiners, options, responsiveOptions);
++}
++
++function loadStatsChart() {
++  var url = API + "pools/" + currentPool + "/performance";
++  var requestId = ++statsChartRequestId;
++
++  if (statsChartXhr && statsChartXhr.readyState !== 4) {
++    statsChartXhr.abort();
++  }
++
++  function attemptFetch(attemptIndex) {
++    var attemptNumber = attemptIndex + 1;
++    statsChartXhr = $.ajax({
++      url: url,
++      timeout: STATS_CHART_TIMEOUT_MS
++    })
++      .done(function(data) {
++        if (requestId !== statsChartRequestId) return;
++        statsChartLastData = data;
++        statsChartNotifyTs = 0;
++        renderStatsChart(data);
++      })
++      .fail(function(jqXHR, textStatus) {
++        if (requestId !== statsChartRequestId) return;
++        if (textStatus === "abort") return;
++        var status = jqXHR && typeof jqXHR.status !== "undefined" ? jqXHR.status : 0;
++        console.warn(
++          "loadStatsChart failed",
++          url,
++          "status=" + status,
++          "attempt=" + attemptNumber
++        );
++        if (attemptIndex < STATS_CHART_RETRY_DELAYS_MS.length) {
++          var delay = STATS_CHART_RETRY_DELAYS_MS[attemptIndex];
++          setTimeout(function() {
++            if (requestId !== statsChartRequestId) return;
++            attemptFetch(attemptIndex + 1);
++          }, delay);
++          return;
++        }
++        notifyStatsChartUnavailable();
++        if (statsChartLastData) {
++          renderStatsChart(statsChartLastData);
++        }
++      });
++    return statsChartXhr;
++  }
++
++  return attemptFetch(0);
++}
++
++
++// DASHBOARD page data
++function loadDashboardData(walletAddress) {
++  return $.ajax(API + "pools/" + currentPool + "/miners/" + walletAddress)
++    .done(function(data) {
++      $("#pendingShares").text(_formatter(data.pendingShares, 0, ""));
++      var workerHashRate = 0;
++      if (data.performance) {
++        $.each(data.performance.workers, function(index, value) {
++          workerHashRate += value.hashrate;
++        });
++      }
++      lastMinerHashrate = workerHashRate;
++      $("#minerHashRate").text(_formatter(workerHashRate, 5, "H/s"));
++      $("#pendingBalance").text(_formatter(data.pendingBalance, 5, ""));
++      $("#paidBalance").text(_formatter(data.todayPaid, 5, ""));
++      $("#lifetimeBalance").text(_formatter(data.pendingBalance + data.totalPaid, 5, "")
++      );
++
++      var minerTtf = computeTtfSeconds(currentNetworkDifficulty, workerHashRate);
++      $("#minerTtfBlock").text(formatDuration(minerTtf));
++      $("#minerChanceBlock").text(renderChanceLine(minerTtf));
++      if (currentNetworkDifficulty === null || currentNetworkDifficulty <= 0) {
++        loadStatsData();
++      }
++    })
++    .fail(function() {
++      $.notify(
++        {
++          message: "Error: No response from API.<br>(loadDashboardData)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    });
++}
++
++
++// DASHBOARD page Miner table
++function loadDashboardWorkerList(walletAddress) {
++  return $.ajax(API + "pools/" + currentPool + "/miners/" + walletAddress)
++    .done(function(data) {
++      var workerList = "";
++      if (data.performance) {
++        var workerCount = 0;
++        $.each(data.performance.workers, function(index, value) {
++          workerCount++;
++          workerList += "<tr>";
++          workerList += "<td>" + workerCount + "</td>";
++          var workerName = index || "";
++          if (workerName.length === 0 || workerName === "0") {
++            workerName = "default";
++          }
++          workerList += "<td>" + workerName + "</td>";
++          workerList += "<td>" + _formatter(value.hashrate, 5, "H/s") + "</td>";
++          workerList +=
++            "<td>" + _formatter(value.sharesPerSecond, 5, "S/s") + "</td>";
++          workerList += "</tr>";
++        });
++      } else {
++        workerList += '<tr><td colspan="4">None</td></tr>';
++      }
++      $("#workerCount").text(workerCount);
++      $("#workerList").html(workerList);
++    })
++    .fail(function() {
++      $.notify(
++        {
++          message: "Error: No response from API.<br>(loadDashboardWorkerList)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    });
++}
++
++
++// DASHBOARD page chart
++function loadDashboardChart(walletAddress) {
++  return $.ajax(API + "pools/" + currentPool + "/miners/" + walletAddress + "/performance")
++    .done(function(data) {
++
++		labels = [];
++        minerHashRate = [];
++		
++        $.each(data, function(index, value) {
++          if (labels.length === 0 || (labels.length + 1) % 4 === 1) {
++            var createDate = convertLocalDateToUTCDate(
++              new Date(value.created),
++              false
++            );
++            labels.push(createDate.getHours() + ":00");
++          } else {
++            labels.push("");
++          }
++          var workerHashRate = 0;
++          $.each(value.workers, function(index2, value2) {workerHashRate += value2.hashrate;});
++          minerHashRate.push(workerHashRate);
++        });
++        var data = {labels: labels,series: [minerHashRate]};
++        var options = {
++          height: "200px",
++		  showArea: true,
++		  seriesBarDistance: 1,
++          axisX: {
++            showGrid: false
++          },
++          axisY: {
++            offset: 47,
++            labelInterpolationFnc: function(value) {
++              return _formatter(value, 1, "");
++            }
++          },
++          lineSmooth: Chartist.Interpolation.simple({
++            divisor: 2
++          })
++        };
++        var responsiveOptions = [
++          [
++          "screen and (max-width: 320px)",
++          {
++            axisX: {
++              labelInterpolationFnc: function(value) {
++                return value[0];
++              }
++            }
++          }
++        ]
++        ];
++        Chartist.Line("#chartDashboardHashRate", data, options, responsiveOptions);
++
++    })
++    .fail(function() {
++      $.notify(
++        {
++          message: "Error: No response from API.<br>(loadDashboardChart)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    });
++}
++
++
++// Generate Coin based sidebar
++function loadNavigation() {
++  return $.ajax(API + "pools")
++    .done(function(data) {
++		  var coinLogo = "";
++		  var coinName = "";
++		  var poolList = "<ul class='navbar-nav '>";
++	      $.each(data.pools, function(index, value) {
++            var modeLabel = getPoolModeLabel(value);
++			poolList += "<li class='nav-item'>";
++	        poolList += "  <a href='#/" + value.id.toLowerCase() + "' class='nav-link coin-header" + (currentPool == value.id.toLowerCase() ? " coin-header-active" : "") + "'>"
++			poolList += "  <img class='coinimg' src='/assets/brand/favicon.svg' alt='" + BRAND.coinSymbol + "' /> " + BRAND.coinSymbol + " " + modeLabel;
++	        poolList += "  </a>";
++			poolList += "</li>";
++			if (currentPool === value.id) {
++				coinLogo = "<img style='width:40px' src='/assets/brand/favicon.svg' alt='" + BRAND.coinSymbol + "' />";
++				coinName = BRAND.coinName + " (" + modeLabel + ")";
++			}
++	      });
++	      poolList += "</ul>";
++	  
++      if (poolList.length > 0) {
++        $(".coin-list-header").html(poolList);
++      }
++	  
++	  var sidebarList = "";
++	  const sidebarTemplate = $(".sidebar-template").html();
++      sidebarList += sidebarTemplate
++		.replace(/{{ coinId }}/g, currentPool)
++		.replace(/{{ coinLogo }}/g, coinLogo)
++		.replace(/{{ coinName }}/g, coinName)
++      $(".sidebar-wrapper").html(sidebarList);
++  
++      $("a.link").each(function() {
++	    if (localStorage[currentPool + "-walletAddress"] && this.href.indexOf("/dashboard") > 0)
++	    {
++		  this.href = "#/" + currentPool + "/dashboard?address=" + localStorage[currentPool + "-walletAddress"];
++	    } 
++      });
++
++    })
++    .fail(function() {
++      $.notify(
++        {
++          message: "Error: No response from API.<br>(loadNavigation)"
++        },
++        {
++          type: "danger",
++          timer: 3000
++        }
++      );
++    });
++}
+-- 
+2.43.0
+

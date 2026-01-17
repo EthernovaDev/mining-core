@@ -1,0 +1,19 @@
+[Unit]
+Description=Miningcore NOVA Pool
+After=network-online.target postgresql.service
+Wants=network-online.target
+Requires=postgresql.service
+
+[Service]
+Type=simple
+User=miningcore
+Group=miningcore
+WorkingDirectory=/opt/miningcore/build
+Environment=DOTNET_ROOT=/usr/share/dotnet
+ExecStart=/opt/miningcore/build/Miningcore -c /etc/miningcore/config.json
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

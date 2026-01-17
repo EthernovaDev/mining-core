@@ -2,6 +2,8 @@
 
 This kit gives you a clean, copy-paste setup for running a NOVA pool (PPLNS/PROP) or SOLO on Miningcore.
 
+Deployment kit (Ubuntu 22.04/24.04): operator-kit/deploy/README-DEPLOY.md
+
 ## Versions
 - Ethernova CoreGeth v1.2.7+
 - Miningcore: this fork (EthernovaDev/mining-core). Record the exact commit you deploy with `git rev-parse HEAD`.
