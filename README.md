@@ -1,6 +1,7 @@
 # Ethernova (NOVA) Miningcore Operator Kit
 
 Start here: [operator-kit/README.md](operator-kit/README.md)
+Deployment kit: [operator-kit/deploy/README-DEPLOY.md](operator-kit/deploy/README-DEPLOY.md)
 
 - Algorithm: Ethash
 - Mainnet chainId/networkId: 121525 (chainId hex 0x1dab5)

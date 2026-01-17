@@ -1,0 +1,17 @@
+[Unit]
+Description=Ethernova CoreGeth Node
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ethernova
+Group=ethernova
+WorkingDirectory=/var/lib/ethernova
+ExecStart=/opt/ethernova-coregeth/build/bin/ethernova --config /etc/ethernova/ethernova.toml
+Restart=always
+RestartSec=5
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

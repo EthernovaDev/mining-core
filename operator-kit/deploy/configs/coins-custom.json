@@ -1,0 +1,19 @@
+{
+  "ethernova": {
+    "name": "Ethernova",
+    "canonicalName": "Ethernova",
+    "symbol": "NOVA",
+    "family": "ethereum",
+    "website": "",
+    "market": "",
+    "twitter": "",
+    "telegram": "",
+    "discord": "",
+    "explorerBlockLinks": {
+      "block": "https://explorer.example.com/block/$height$",
+      "uncle": "https://explorer.example.com/block/$height$"
+    },
+    "explorerTxLink": "https://explorer.example.com/tx/{0}",
+    "explorerAccountLink": "https://explorer.example.com/address/{0}"
+  }
+}
